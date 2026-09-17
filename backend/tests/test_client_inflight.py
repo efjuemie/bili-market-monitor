@@ -33,6 +33,30 @@ async def test_same_cluster_requests_share_one_inflight_http_call():
 
 
 @pytest.mark.asyncio
+async def test_fetch_uses_market_browser_headers_to_avoid_412():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "available.json").read_text(encoding="utf-8"))
+    seen = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.update({key.lower(): value for key, value in request.headers.items()})
+        if seen.get("user-agent", "").startswith("python-httpx"):
+            return httpx.Response(412)
+        return httpx.Response(200, json=fixture)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = BiliMarketClient(Settings(), http_client)
+    try:
+        payload = await client.fetch(10000002733)
+    finally:
+        await http_client.aclose()
+
+    assert payload["code"] == 0
+    assert seen["accept"] == "application/json, text/plain, */*"
+    assert seen["referer"].endswith("/neul-next/resell/home.html")
+    assert seen["user-agent"].startswith("Mozilla/5.0")
+
+
+@pytest.mark.asyncio
 async def test_fetch_with_events_records_rate_limit_and_retry_success(monkeypatch):
     fixture = json.loads((Path(__file__).parent / "fixtures" / "available.json").read_text(encoding="utf-8"))
     responses = [

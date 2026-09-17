@@ -9,6 +9,12 @@ import httpx
 
 from app.core.config import Settings
 
+BILI_BROWSER_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://mall.bilibili.com/neul-next/resell/home.html",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+}
+
 
 @dataclass
 class BiliRequestAttempt:
@@ -81,7 +87,11 @@ class BiliMarketClient:
                     attempt_started = time.perf_counter()
                     try:
                         self.total_requests += 1
-                        response = await self._client.post(url, json=payload)
+                        # The B站市集 edge rejects the default httpx user agent
+                        # with 412. These are the same non-sensitive browser
+                        # headers used by the market page itself; no cookies or
+                        # account credentials are required for this endpoint.
+                        response = await self._client.post(url, json=payload, headers=BILI_BROWSER_HEADERS)
                         if response.status_code == 429:
                             self.rate_limited_requests += 1
                             events.append(self._event(cluster_id, response.status_code, False, attempt_started))

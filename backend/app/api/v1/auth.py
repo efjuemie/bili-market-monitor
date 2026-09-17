@@ -3,6 +3,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -56,10 +57,20 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
         password_hash=hash_password(payload.password), created_at=now, updated_at=now,
     )
     db.add(user)
-    db.flush()
+    try:
+        # The pre-check above is only an optimization; concurrent requests can
+        # still race on the database unique constraint.
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise AppError("USERNAME_ALREADY_EXISTS", "用户名已存在", 409) from exc
     token = new_token()
     db.add(UserSession(id=str(uuid4()), user_id=user.id, token_hash=hash_token(token), expires_at=now + timedelta(days=settings.session_ttl_days), created_at=now, last_seen_at=now))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise AppError("USERNAME_ALREADY_EXISTS", "用户名已存在", 409) from exc
     set_session_cookie(response, token, settings)
     return {"user": public_user(user)}
 
