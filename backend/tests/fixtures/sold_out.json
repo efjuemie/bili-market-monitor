@@ -1,0 +1,17 @@
+{
+  "code": 0,
+  "data": {
+  "clusterHeaderFloorVO": {
+    "title": "售罄示例商品",
+    "clusterImgList": ["//i0.hdslb.com/bfs/mall/sold.jpg"],
+    "header": []
+  },
+  "clusterPurchaseButton": {
+    "buttonState": 2,
+    "buttonText": "已售罄",
+    "buttonDisabled": true
+  },
+  "clusterPriceFloorVO": {"priceTag": {"price": "199"}},
+  "clusterRecentBuyFloorVO": {"avgPrice": "150", "recentDeals": [{"dealPrice": "150", "dealTimeText": "昨天"}]}
+  }
+}

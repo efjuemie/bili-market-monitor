@@ -1,0 +1,20 @@
+{
+  "code": 0,
+  "data": {
+  "clusterHeaderFloorVO": {
+    "title": "TAITO T-most 更衣人偶坠入爱河 喜多川海梦 利兹Ver.",
+    "clusterImgList": ["//i0.hdslb.com/bfs/mall/cover.jpg"],
+    "header": [{"shareExtra": {"url": "https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000002733"}}]
+  },
+  "clusterPurchaseButton": {
+    "buttonState": 1,
+    "buttonText": "最低价仅2件",
+    "buttonSubText": "¥129",
+    "buttonPriceDescVO": {"priceIntegerPart": "129", "priceDecimalPart": null},
+    "buttonDisabled": false,
+    "deliveryModeDesc": "现货"
+  },
+  "clusterPriceFloorVO": {"priceTag": {"firstPrice": "129", "price": "139", "pricePrefix": "参考价"}},
+  "clusterRecentBuyFloorVO": {"avgPrice": "109.59", "recentDeals": [{"dealPrice": "129", "dealTimeText": "5天前"}]}
+  }
+}
