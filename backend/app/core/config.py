@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_base_url: str = "http://localhost:5173"
     app_timezone: str = "Asia/Shanghai"
-    version: str = "0.1.0"
+    version: str = "0.1.1"
     database_url: str = "sqlite:///./app.db"
 
     session_cookie_name: str = "session"
