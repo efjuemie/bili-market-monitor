@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bili-market-monitor"
-version = "0.1.4"
+version = "0.1.5"
 description = "B站市集好价提示系统 backend"
 requires-python = ">=3.12"
 dependencies = [

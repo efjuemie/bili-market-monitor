@@ -17,6 +17,15 @@ from app.errors import AppError
 from app.models import BiliFavorite, BiliPriceHistory, BiliProduct, NotificationOutbox, User
 from app.schemas import FavoriteCreateRequest, FavoriteUpdateRequest
 from app.services.bili_market.cover import COVER_CACHE_CONTROL, CoverProxyError, fetch_cover
+from app.services.bili_market.history import (
+    DEFAULT_HISTORY_RANGE,
+    DEFAULT_MAX_HISTORY_POINTS,
+    HISTORY_RANGES_HOURS,
+    MAX_HISTORY_POINTS,
+    MIN_HISTORY_POINTS,
+    downsample_history,
+    downsample_history_stream,
+)
 from app.services.bili_market.service import (
     ProductService,
     iso,
@@ -174,13 +183,27 @@ async def refresh_favorite(cluster_id: int, db: Session = Depends(get_db), user:
 
 
 @router.get("/products/{cluster_id}/history")
-def product_history(cluster_id: int, range: str = "7d", db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> Dict[str, Any]:
+def product_history(cluster_id: int, range: str = DEFAULT_HISTORY_RANGE, max_points: int = DEFAULT_MAX_HISTORY_POINTS, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> Dict[str, Any]:
     product = db.scalar(select(BiliProduct).where(BiliProduct.cluster_id == validate_cluster_id(cluster_id)))
     if not product:
         raise AppError("PRODUCT_NOT_FOUND", "未找到该商品", 404)
-    if range not in {"24h", "7d", "30d", "90d"}:
+    if range not in HISTORY_RANGES_HOURS:
         raise AppError("INVALID_HISTORY_RANGE", "历史范围无效", 422)
-    hours = {"24h": 24, "7d": 24 * 7, "30d": 24 * 30, "90d": 24 * 90}[range]
+    if max_points < MIN_HISTORY_POINTS or max_points > MAX_HISTORY_POINTS:
+        raise AppError("INVALID_HISTORY_MAX_POINTS", f"返回点数必须在 {MIN_HISTORY_POINTS} 到 {MAX_HISTORY_POINTS} 之间", 422)
+    hours = HISTORY_RANGES_HOURS[range]
     cutoff = utcnow() - timedelta(hours=hours)
-    rows = db.scalars(select(BiliPriceHistory).where(BiliPriceHistory.product_id == product.id, BiliPriceHistory.observed_at >= cutoff).order_by(BiliPriceHistory.observed_at)).all()
-    return {"cluster_id": cluster_id, "range": range, "items": [{"observed_at": iso(row.observed_at), "available": row.available, "current_price": money(row.current_price), "reference_price": money(row.reference_price)} for row in rows]}
+    history_filter = (BiliPriceHistory.product_id == product.id, BiliPriceHistory.observed_at >= cutoff)
+    total_points = db.scalar(select(func.count(BiliPriceHistory.id)).where(*history_filter)) or 0
+    history_query = select(BiliPriceHistory).where(*history_filter).order_by(BiliPriceHistory.observed_at)
+    if total_points <= max_points:
+        points = downsample_history(db.scalars(history_query).all(), max_points)
+    else:
+        points = downsample_history_stream(db.scalars(history_query).yield_per(1000), total_points, max_points)
+    return {
+        "cluster_id": cluster_id,
+        "range": range,
+        "total_points": total_points,
+        "returned_points": len(points),
+        "items": [{"observed_at": iso(row.observed_at), "available": row.available, "current_price": money(row.current_price), "reference_price": money(row.reference_price)} for row in points],
+    }

@@ -1,5 +1,5 @@
+import asyncio
 import json
-from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.security import utcnow
 from app.models import Base, BiliPriceHistory, BiliProduct, BiliRequestEvent
-from app.services.bili_market.client import BiliRequestAttempt
+from app.services.bili_market.client import BiliAPIError, BiliRequestAttempt
 from app.services.bili_market.service import ProductService
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -32,6 +32,14 @@ class FakeClient:
 
     async def fetch_with_events(self, cluster_id):
         return self.payload, self.events
+
+
+class FailingClient:
+    def __init__(self, error):
+        self.error = error
+
+    async def fetch_with_events(self, cluster_id):
+        raise self.error
 
 
 @pytest.fixture
@@ -74,7 +82,7 @@ async def test_invalid_bili_business_response_keeps_last_successful_product(db):
 
 
 @pytest.mark.asyncio
-async def test_history_records_status_change_and_30_minute_heartbeat(db):
+async def test_history_records_every_successful_upstream_observation(db):
     settings = Settings()
     client = FakeClient(load("available.json"))
     service = ProductService(settings, client)
@@ -84,19 +92,59 @@ async def test_history_records_status_change_and_30_minute_heartbeat(db):
     assert db.query(BiliPriceHistory).count() == 1
 
     await service.fetch_and_persist(db, 10000002733, force=True)
-    assert db.query(BiliPriceHistory).count() == 1
-
-    first = db.scalar(select(BiliPriceHistory).where(BiliPriceHistory.product_id == product.id))
-    first.observed_at = utcnow() - timedelta(minutes=31)
-    db.commit()
     await service.fetch_and_persist(db, 10000002733, force=True)
-    assert db.query(BiliPriceHistory).count() == 2
+    assert db.query(BiliPriceHistory).count() == 3
+
+    failing = ProductService(
+        settings,
+        FailingClient(BiliAPIError("BILI_API_UNAVAILABLE", "上游暂时不可用", 503)),
+    )
+    result = await failing.fetch_and_persist(db, 10000002733, force=True)
+    assert result.current_price == Decimal("129.00")
+    assert db.query(BiliPriceHistory).count() == 3
 
     client.payload = load("sold_out.json")
     await service.fetch_and_persist(db, 10000002733, force=True)
+    assert db.query(BiliPriceHistory).count() == 4
     assert product.available is False
     assert product.current_price is None
-    assert db.query(BiliPriceHistory).count() == 3
+    latest = db.scalars(select(BiliPriceHistory).order_by(BiliPriceHistory.observed_at.desc())).first()
+    assert latest.available is False
+    assert latest.current_price is None
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_does_not_write_history(db):
+    service = ProductService(Settings(bili_cache_reuse_seconds=60), FakeClient(load("available.json")))
+
+    product = await service.fetch_and_persist(db, 10000002733, force=True)
+    await service.fetch_and_persist(db, 10000002733)
+
+    assert product is not None
+    assert db.query(BiliPriceHistory).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_same_product_concurrent_callers_share_one_request_and_history_point(db):
+    class CountingClient(FakeClient):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.calls = 0
+
+        async def fetch_with_events(self, cluster_id):
+            self.calls += 1
+            await asyncio.sleep(0.01)
+            return await super().fetch_with_events(cluster_id)
+
+    client = CountingClient(load("available.json"))
+    service = ProductService(Settings(bili_cache_reuse_seconds=60), client)
+    await asyncio.gather(
+        service.fetch_and_persist(db, 10000002733, force=True),
+        service.fetch_and_persist(db, 10000002733, force=True),
+    )
+
+    assert client.calls == 1
+    assert db.query(BiliPriceHistory).count() == 1
 
 
 @pytest.mark.asyncio

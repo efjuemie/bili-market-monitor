@@ -1,11 +1,11 @@
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from sqlalchemy import desc, select, text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,29 @@ from app.errors import AppError
 from app.models import BiliPriceHistory, BiliProduct, BiliRequestEvent
 from app.services.bili_market.client import BiliAPIError, BiliMarketClient, BiliRequestAttempt
 from app.services.bili_market.parser import BiliProductSnapshot, parse_cluster_info
+
+
+# A ProductService instance is created per API request, while the Bili client
+# intentionally shares in-flight requests. Keep a process-local per-cluster
+# lock as well so two callers that await the same upstream request cannot both
+# persist the same observation. PostgreSQL's advisory transaction lock remains
+# the cross-process coordination mechanism.
+class _ProductLockState:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+_PRODUCT_LOCKS: dict[int, _ProductLockState] = {}
+
+
+def _product_lock_state(cluster_id: int) -> _ProductLockState:
+    state = _PRODUCT_LOCKS.get(cluster_id)
+    if state is None:
+        state = _ProductLockState()
+        _PRODUCT_LOCKS[cluster_id] = state
+    state.users += 1
+    return state
 
 
 def _aware(value: Optional[datetime]) -> Optional[datetime]:
@@ -76,28 +99,21 @@ def _product_from_snapshot(product: BiliProduct, snapshot: BiliProductSnapshot, 
     product.updated_at = now
 
 
-def maybe_write_history(db: Session, product: BiliProduct, previous_available: Optional[bool], previous_price: Optional[Decimal], now: datetime) -> None:
-    previous = db.scalar(select(BiliPriceHistory).where(BiliPriceHistory.product_id == product.id).order_by(desc(BiliPriceHistory.observed_at)).limit(1))
-    should_write = previous is None
-    if previous is not None:
-        previous_time = _aware(previous.observed_at) or now
-        should_write = (
-            previous.available != product.available
-            or previous.current_price != product.current_price
-            or now - previous_time >= timedelta(minutes=30)
-        )
-    # previous_available/price are included to make a first update explicit and
-    # to keep this helper easy to reason about when callers have a snapshot.
-    if previous is not None and previous_available is not None:
-        should_write = should_write or previous_available != product.available or previous_price != product.current_price
-    if should_write:
-        db.add(BiliPriceHistory(
-            product_id=product.id,
-            observed_at=now,
-            available=product.available,
-            current_price=product.current_price,
-            reference_price=product.reference_price,
-        ))
+def write_history_observation(db: Session, product: BiliProduct, observed_at: datetime) -> None:
+    """Record one observation for one successfully parsed upstream response.
+
+    This intentionally has no change-detection or heartbeat threshold. The
+    caller invokes it only after a fresh Bili response has been parsed, so a
+    successful same-price check is still meaningful history. Cache hits and
+    failure fallbacks never reach this function.
+    """
+    db.add(BiliPriceHistory(
+        product_id=product.id,
+        observed_at=observed_at,
+        available=product.available,
+        current_price=product.current_price if product.available else None,
+        reference_price=product.reference_price,
+    ))
 
 
 class ProductService:
@@ -116,10 +132,19 @@ class ProductService:
             return True, None
         deadline = time.monotonic() + self.settings.bili_product_lock_timeout_seconds
         delay = 0.05
+        waited_for_lock = False
         while True:
             acquired = bool(db.execute(text("SELECT pg_try_advisory_xact_lock(:lock_key)"), {"lock_key": -int(cluster_id)}).scalar())
             if acquired:
+                if waited_for_lock and allow_cache_reuse:
+                    db.expire_all()
+                    cached = self.get_product(db, cluster_id)
+                    if cached and cached.last_success_at:
+                        last_success = _aware(cached.last_success_at)
+                        if last_success and (utcnow() - last_success).total_seconds() <= self.settings.bili_cache_reuse_seconds:
+                            return False, cached
                 return True, None
+            waited_for_lock = True
             db.rollback()
             db.expire_all()
             cached = self.get_product(db, cluster_id)
@@ -154,14 +179,18 @@ class ProductService:
             ))
             event.persisted = True
 
-    async def fetch_and_persist(self, db: Session, cluster_id: int, force: bool = False) -> BiliProduct:
+    async def _fetch_and_persist_locked(self, db: Session, cluster_id: int, force: bool = False) -> BiliProduct:
         now = utcnow()
         product = self.get_product(db, cluster_id)
         if not force and product and product.last_success_at:
             last_success = _aware(product.last_success_at)
             if last_success and (now - last_success).total_seconds() <= self.settings.bili_cache_reuse_seconds:
                 return product
-        locked, cached = await self._try_lock_product(db, cluster_id, allow_cache_reuse=not force)
+        # If this caller had to wait for another caller, a fresh result from
+        # that caller is safe to reuse even when this invocation was forced.
+        # A caller that acquires the lock immediately still bypasses the cache
+        # when force=True.
+        locked, cached = await self._try_lock_product(db, cluster_id, allow_cache_reuse=True)
         if cached is not None:
             return cached
         if not locked:
@@ -239,14 +268,32 @@ class ProductService:
                 product = self.get_product(db, cluster_id)
                 if product is None:
                     raise
-        previous_available = product.available if product.last_success_at else None
-        previous_price = product.current_price if product.last_success_at else None
-        _product_from_snapshot(product, snapshot, now)
-        maybe_write_history(db, product, previous_available, previous_price, now)
+        observed_at = utcnow()
+        _product_from_snapshot(product, snapshot, observed_at)
+        write_history_observation(db, product, observed_at)
         self._record_request_events(db, events)
         db.commit()
         db.refresh(product)
         return product
+
+    async def fetch_and_persist(self, db: Session, cluster_id: int, force: bool = False) -> BiliProduct:
+        # The lock also covers the initial cache check. This matters for
+        # SQLite/dev deployments where PostgreSQL advisory locks are absent,
+        # and prevents duplicate history points for concurrent API callers.
+        state = _product_lock_state(cluster_id)
+        waited_for_same_product = state.lock.locked()
+        try:
+            async with state.lock:
+                # A forced caller that waited for another same-product caller
+                # should reuse that fresh result instead of issuing a second
+                # request. If the first request failed, the normal stale-data
+                # path will still retry upstream.
+                effective_force = force and not waited_for_same_product
+                return await self._fetch_and_persist_locked(db, cluster_id, force=effective_force)
+        finally:
+            state.users -= 1
+            if state.users == 0 and _PRODUCT_LOCKS.get(cluster_id) is state:
+                _PRODUCT_LOCKS.pop(cluster_id, None)
 
 
 def validate_cluster_id(cluster_id: int) -> int:

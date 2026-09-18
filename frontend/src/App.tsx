@@ -1,10 +1,24 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Scatter,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import type { TooltipContentProps } from "recharts";
 import { APP_VERSION } from "./config";
 
 type User = { id: string; username: string; email: string | null; email_verified: boolean; role: string; is_active: boolean; created_at: string };
 type Product = { cluster_id: number; title: string; cover_url: string | null; detail_url: string; available: boolean; current_price: string | null; reference_price: string | null; purchase_button_text: string | null; delivery_mode: string | null; recent_avg_price: string | null; recent_deal_price: string | null; recent_deal_time_text: string | null; last_checked_at: string | null; last_success_at: string | null; last_error: string | null };
 type Favorite = { id: string; cluster_id: number; product: Product; target_price: string | null; notify_enabled: boolean; check_interval_seconds: number; next_check_at: string | null; last_evaluated_at: string | null; last_condition_met: boolean; last_alert_price: string | null; last_alert_at: string | null; last_manual_refresh_at: string | null };
 type HistoryPoint = { observed_at: string; available: boolean; current_price: string | null; reference_price: string | null };
+type HistoryRange = "1h" | "6h" | "24h" | "7d" | "30d" | "90d";
+type HistoryState = { range: HistoryRange; points: HistoryPoint[]; loadedAt: string; expanded: boolean; pending: boolean };
+type ChartPoint = HistoryPoint & { timestamp: number; price: number | null; reference: number | null; interaction: number };
 type ApiError = { error?: { code?: string; message?: string; details?: ApiErrorDetail[] | { retry_after_seconds?: number } } };
 
 type ApiErrorDetail = { loc?: Array<string | number>; msg?: string; type?: string };
@@ -29,6 +43,7 @@ const intervals = [
 ] as const;
 const BOSS_URL = "https://www.bili-market-boss.top/#/";
 const EMAIL_VERIFICATION_MESSAGE = "开启邮件提醒前，请先前往“个人资料”绑定并验证通知邮箱。";
+const historyRanges: Array<[HistoryRange, string]> = [["1h", "1 小时"], ["6h", "6 小时"], ["24h", "24 小时"], ["7d", "7 天"], ["30d", "30 天"], ["90d", "90 天"]];
 
 function isEmailVerificationRequired(error: unknown) {
   return error instanceof ApiRequestError && error.code === "EMAIL_VERIFICATION_REQUIRED";
@@ -119,12 +134,80 @@ type AuthFieldErrors = { username?: string; password?: string; confirmPassword?:
 function formatInterval(seconds: number) { return intervals.find(([value]) => value === seconds)?.[1] || `${seconds} 秒`; }
 function formatTime(value: string | null) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未更新"; }
 
-function HistoryChart({ points }: { points: HistoryPoint[] }) {
-  const priced = points.filter(point => point.current_price !== null);
-  if (!priced.length) return <p className="hint">暂无可购买价格历史；售罄期间不会伪造价格点。</p>;
-  const values = priced.map(point => Number(point.current_price)); const min = Math.min(...values); const max = Math.max(...values); const span = max - min || 1;
-  const polyline = priced.map((point, index) => `${(index / Math.max(1, priced.length - 1)) * 320},${78 - ((Number(point.current_price) - min) / span) * 64}`).join(" ");
-  return <div className="history-chart"><svg viewBox="0 0 320 90" role="img" aria-label="价格历史走势图" preserveAspectRatio="none"><line x1="0" y1="78" x2="320" y2="78" stroke="#e5ebf2" /><polyline points={polyline} fill="none" stroke="#00aeec" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" /></svg><div className="chart-labels"><span>¥{min.toFixed(2)}</span><span>{priced.length} 个价格点</span><span>¥{max.toFixed(2)}</span></div></div>;
+function formatChartTime(value: number, range: HistoryRange) {
+  const options: Intl.DateTimeFormatOptions = range === "1h" || range === "6h"
+    ? { hour: "2-digit", minute: "2-digit", hour12: false }
+    : range === "24h"
+      ? { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }
+      : { month: "numeric", day: "numeric" };
+  return new Date(value).toLocaleString("zh-CN", options);
+}
+
+function formatPrice(value: number | null) {
+  return value === null || !Number.isFinite(value) ? "—" : `¥${value.toFixed(2)}`;
+}
+
+function HistoryTooltip({ active, payload }: Partial<TooltipContentProps<number, string>>) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0]?.payload as ChartPoint | undefined;
+  if (!point) return null;
+  return <div className="history-tooltip"><strong>{formatTime(point.observed_at)}</strong><span>状态：{point.available ? "可购买" : "已售罄"}</span><span>当前价格：{formatPrice(point.price)}</span><span>参考价：{formatPrice(point.reference)}</span></div>;
+}
+
+function HistoryChart({ points, range, onRangeChange, loading }: { points: HistoryPoint[]; range: HistoryRange; onRangeChange: (range: HistoryRange) => void; loading: boolean }) {
+  const [selectedPoint, setSelectedPoint] = useState<ChartPoint | null>(null);
+  const [coarsePointer, setCoarsePointer] = useState(false);
+  useEffect(() => setSelectedPoint(null), [range]);
+  useEffect(() => {
+    const media = window.matchMedia("(pointer: coarse)");
+    setCoarsePointer(media.matches);
+  }, []);
+  const chartPoints = points.map(point => ({
+    ...point,
+    timestamp: new Date(point.observed_at).getTime(),
+    price: point.current_price === null ? null : Number(point.current_price),
+    reference: point.reference_price === null ? null : Number(point.reference_price),
+  })).filter(point => Number.isFinite(point.timestamp)) as Omit<ChartPoint, "interaction">[];
+  const priced = chartPoints.filter(point => point.price !== null && Number.isFinite(point.price));
+  const allSoldOut = chartPoints.length > 0 && priced.length === 0;
+  const chartMin = priced.length ? Math.min(...priced.map(point => point.price as number)) : 0;
+  const chartMax = priced.length ? Math.max(...priced.map(point => point.price as number)) : 0;
+  const domain: [number | string, number | string] = chartMin === chartMax ? [Math.max(0, chartMin - 1), chartMax + 1] : ["auto", "auto"];
+  const chartMinTime = chartPoints.length ? Math.min(...chartPoints.map(point => point.timestamp)) : 0;
+  const chartMaxTime = chartPoints.length ? Math.max(...chartPoints.map(point => point.timestamp)) : 0;
+  const timePadding = chartMinTime === chartMaxTime ? 30 * 60 * 1000 : 0;
+  const timeDomain: [number | string, number | string] = chartPoints.length ? [chartMinTime - timePadding, chartMaxTime + timePadding] : ["dataMin", "dataMax"];
+  const interactionPoints: ChartPoint[] = chartPoints.map(point => ({ ...point, interaction: chartMin }));
+  const showDots = priced.length <= 48;
+
+  return <section className="history-panel" aria-label="价格历史">
+    <div className="history-toolbar">
+      <div><strong>价格历史</strong><span className="hint">{loading ? "正在加载…" : `${chartPoints.length} 个记录`}</span></div>
+      <div className="history-range" role="group" aria-label="历史时间范围">{historyRanges.map(([value, label]) => <button key={value} type="button" className={range === value ? "active" : ""} aria-pressed={range === value} onClick={() => onRangeChange(value)} disabled={loading}>{label}</button>)}</div>
+    </div>
+    {!chartPoints.length ? <p className="history-empty">暂无该时间范围内的价格历史记录。</p> : allSoldOut ? <p className="history-empty">该时间范围内全部售罄，没有可绘制的价格点。</p> : <>
+      <div className="history-chart" role="img" aria-label="价格历史走势图，点击或触摸数据点可查看详情">
+        <ResponsiveContainer width="100%" height={250} minWidth={0}>
+          <LineChart data={chartPoints} margin={{ top: 12, right: 12, left: 4, bottom: 8 }} onClick={state => {
+            const rawIndex = state?.activeTooltipIndex;
+            const indexValue = rawIndex === undefined || rawIndex === null ? Number.NaN : Number(rawIndex);
+            const index = Number.isInteger(indexValue) && indexValue >= 0 && indexValue < interactionPoints.length ? indexValue : null;
+            const point = index === null ? undefined : interactionPoints[index];
+            if (point) setSelectedPoint(point);
+          }}>
+            <CartesianGrid stroke="#e8eef5" strokeDasharray="3 3" />
+            <XAxis dataKey="timestamp" type="number" scale="time" domain={timeDomain} tickFormatter={value => formatChartTime(Number(value), range)} tick={{ fontSize: 11, fill: "#8994a8" }} minTickGap={28} />
+            <YAxis dataKey="price" domain={domain} tickFormatter={value => `¥${Number(value).toFixed(0)}`} tick={{ fontSize: 11, fill: "#8994a8" }} width={48} allowDataOverflow={false} />
+            <Tooltip content={<HistoryTooltip />} trigger={coarsePointer ? "click" : "hover"} cursor={{ stroke: "#b9dcea", strokeDasharray: "4 4" }} />
+            <Line type="monotone" dataKey="price" name="当前价格" stroke="#00aeec" strokeWidth={2.5} dot={showDots ? { r: 3, fill: "#00aeec", strokeWidth: 0 } : false} activeDot={{ r: 6 }} connectNulls={false} isAnimationActive={false} />
+            <Scatter data={interactionPoints} dataKey="interaction" fill="rgba(0,0,0,0.001)" stroke="transparent" isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      {selectedPoint && <div className="history-touch-detail" aria-live="polite"><strong>{formatTime(selectedPoint.observed_at)}</strong><span>状态：{selectedPoint.available ? "可购买" : "已售罄"}</span><span>价格：{formatPrice(selectedPoint.price)} · 参考价：{formatPrice(selectedPoint.reference)}</span></div>}
+      <div className="chart-labels"><span>最低 {formatPrice(chartMin)}</span><span>{priced.length} 个可购买价格点</span><span>最高 {formatPrice(chartMax)}</span></div>
+    </>}
+  </section>;
 }
 
 function Header({ user, page, setPage, onLogout }: { user: User | null; page: string; setPage: (value: string) => void; onLogout: () => void }) {
@@ -196,23 +279,299 @@ function SearchPage({ user, onRequireLogin, onOpenProfile, onOpenTutorial }: { u
   return <main className="page"><section className="hero"><span className="eyebrow">BILI MARKET MONITOR · v{APP_VERSION}</span><h1>先看清价格，再决定要不要出手。</h1><p>粘贴 B 站市集商品的 ClsId，查询当前最低可购买价，并设置自己的目标价格提醒。</p><form className="search-form" onSubmit={search}><input aria-label="商品 ID" value={clusterId} onChange={e => { setClusterId(e.target.value); setMessage(""); }} placeholder="输入商品 ID，例如 10000002733" inputMode="numeric" aria-invalid={Boolean(message)} aria-describedby={message ? "search-error" : undefined} className={message ? "input-error" : ""} /><button className="primary" disabled={loading}>{loading ? "查询中…" : "查询商品"}</button></form>{message && <p id="search-error" className="error search-error" role="alert" aria-live="polite">{message}</p>}<p className="privacy-note">价格监控直接使用 B 站市集接口；查询结果会保留最近一次成功数据。</p></section>{product && <ProductCard product={product} user={user} onFavorite={favorite} onRefresh={refresh} onGoToProfile={onOpenProfile} /> }<section className="help-card"><div><span className="eyebrow">CLS ID 教程</span><h2>还没有商品 ID？</h2><p>打开 BiliMarketBoss，搜索目标商品并先收藏它，再进入“收藏”页复制商品的 ClsId。</p></div><div className="help-actions"><a className="button primary" href={BOSS_URL} target="_blank" rel="noopener noreferrer">打开 BiliMarketBoss ↗</a><button className="button outline" onClick={onOpenTutorial}>查看详细教程</button></div></section>{!user && <section className="signin-prompt"><div><h3>保存收藏并接收提醒</h3><p>注册账户后可以收藏最多 20 件商品，并设置每件商品独立的检查频率。</p></div><button className="button outline" onClick={onRequireLogin}>登录 / 注册</button></section>}</main>;
 }
 
+function countdownSeconds(nextCheckAt: string | null, nowMs: number) {
+  if (!nextCheckAt) return null;
+  const timestamp = Date.parse(nextCheckAt);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.max(0, Math.ceil((timestamp - nowMs) / 1000));
+}
+
 function FavoritesPage({ user, onProductRefresh, onOpenProfile }: { user: User; onProductRefresh: () => void; onOpenProfile: () => void }) {
-  const [items, setItems] = useState<Favorite[]>([]); const [history, setHistory] = useState<Record<string, HistoryPoint[]>>({}); const [message, setMessage] = useState(""); const [emailVerificationRequired, setEmailVerificationRequired] = useState(false);
-  async function load() { try { const data = await api<{ items: Favorite[] }>("/bili-market/favorites"); setItems(data.items); } catch (error) { setMessage(toUserMessage(error)); } }
-  useEffect(() => { void load(); }, []);
-  async function update(item: Favorite, patch: Record<string, unknown>) { try { const next = await api<Favorite>(`/bili-market/favorites/${item.cluster_id}`, { method: "PATCH", body: JSON.stringify(patch) }); setItems(values => values.map(value => value.id === item.id ? next : value)); } catch (error) { if (isEmailVerificationRequired(error)) { setEmailVerificationRequired(true); setMessage(EMAIL_VERIFICATION_MESSAGE); } else { setMessage(toUserMessage(error)); } } }
-  async function remove(item: Favorite) { if (!window.confirm("确定删除这个收藏吗？")) return; try { await api(`/bili-market/favorites/${item.cluster_id}`, { method: "DELETE" }); setItems(values => values.filter(value => value.id !== item.id)); } catch (error) { setMessage(toUserMessage(error)); } }
-  async function refresh(item: Favorite) { try { const result = await api<Product>(`/bili-market/favorites/${item.cluster_id}/refresh`, { method: "POST" }); setItems(values => values.map(value => value.id === item.id ? { ...value, product: result, last_manual_refresh_at: new Date().toISOString() } : value)); onProductRefresh(); } catch (error) { setMessage(toUserMessage(error)); } }
-  async function loadHistory(item: Favorite) { if (history[item.id]) { setHistory(values => { const next = { ...values }; delete next[item.id]; return next; }); return; } try { const data = await api<{ items: HistoryPoint[] }>(`/bili-market/products/${item.cluster_id}/history?range=7d`); setHistory(values => ({ ...values, [item.id]: data.items })); } catch (error) { setMessage(toUserMessage(error)); } }
-  return <main className="page"><div className="page-heading"><div><span className="eyebrow">MONITORING</span><h1>我的收藏</h1><p>每件商品可以独立设置目标价、邮件提醒和检查频率。</p></div><span className="count-pill">{items.length} / 20</span></div>{(!user.email_verified || emailVerificationRequired) && <div className="notice warning email-verification-notice" role="alert"><span>{EMAIL_VERIFICATION_MESSAGE}</span><button className="button outline" onClick={onOpenProfile}>前往个人资料</button></div>}{message && !emailVerificationRequired && <p className="error">{message}</p>}{items.length === 0 ? <div className="empty"><h2>还没有收藏商品</h2><p>回到查询页，粘贴商品 ID 后即可保存。</p></div> : <div className="favorite-grid">{items.map(item => <article className="favorite-card" key={item.id}><div className="favorite-head"><div className="mini-cover"><ProductImage clusterId={item.cluster_id} src={item.product.cover_url} title={item.product.title} /></div><div><h2>{item.product.title}</h2><p className="product-id">{item.cluster_id} · {item.product.available ? `¥${item.product.current_price || "—"}` : "已售罄"}</p></div></div><div className="favorite-settings"><label>目标价<input value={item.target_price || ""} placeholder="未设置" onChange={e => setItems(values => values.map(v => v.id === item.id ? { ...v, target_price: e.target.value } : v))} onBlur={e => update(item, { target_price: e.target.value ? Number(e.target.value) : null })} /></label><label>检查频率<select value={item.check_interval_seconds} onChange={e => update(item, { check_interval_seconds: Number(e.target.value) })}>{intervals.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="switch-label"><input type="checkbox" checked={item.notify_enabled} onChange={e => update(item, { notify_enabled: e.target.checked })} /><span>邮件提醒</span></label></div><p className="hint">最后检查：{formatTime(item.last_evaluated_at)} · {formatInterval(item.check_interval_seconds)}</p>{history[item.id] && <HistoryChart points={history[item.id] || []} />}<div className="favorite-actions"><a className="button outline" href={item.product.detail_url} target="_blank" rel="noopener noreferrer">前往 B 站市集 ↗</a><button className="button outline" onClick={() => refresh(item)}>立即刷新</button><button className="button outline" onClick={() => void loadHistory(item)}>{history[item.id] ? "隐藏价格历史" : "价格历史"}</button><button className="button danger" onClick={() => remove(item)}>删除</button></div></article>)}</div>}</main>;
+  const [items, setItems] = useState<Favorite[]>([]);
+  const [history, setHistory] = useState<Record<string, HistoryState>>({});
+  const [message, setMessage] = useState("");
+  const [emailVerificationRequired, setEmailVerificationRequired] = useState(false);
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const itemsRef = useRef<Favorite[]>([]);
+  const historyRef = useRef<Record<string, HistoryState>>({});
+  const historyRequestIdsRef = useRef<Record<string, number>>({});
+  const mountedRef = useRef(true);
+  const favoritesLoadingRef = useRef(false);
+
+  useEffect(() => { historyRef.current = history; }, [history]);
+  useEffect(() => { itemsRef.current = items; }, [items]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      Object.keys(historyRequestIdsRef.current).forEach(itemId => {
+        historyRequestIdsRef.current[itemId] = (historyRequestIdsRef.current[itemId] || 0) + 1;
+      });
+    };
+  }, []);
+
+  const loadHistoryData = useCallback(async (itemId: string, clusterId: number, range: HistoryRange) => {
+    if (!mountedRef.current) return;
+    const requestId = (historyRequestIdsRef.current[itemId] || 0) + 1;
+    historyRequestIdsRef.current[itemId] = requestId;
+    const previous = historyRef.current[itemId];
+    historyRef.current = {
+      ...historyRef.current,
+      [itemId]: {
+        range,
+        points: previous?.points || [],
+        loadedAt: previous?.loadedAt || "",
+        expanded: true,
+        pending: true,
+      },
+    };
+    setHistory(values => {
+      const previousState = values[itemId];
+      return {
+        ...values,
+        [itemId]: {
+          range,
+          points: previousState?.points || [],
+          loadedAt: previousState?.loadedAt || "",
+          expanded: true,
+          pending: true,
+        },
+      };
+    });
+    try {
+      const data = await api<{ items: HistoryPoint[] }>(`/bili-market/products/${clusterId}/history?range=${range}&max_points=240`);
+      if (!mountedRef.current || historyRequestIdsRef.current[itemId] !== requestId) return;
+      setHistory(values => {
+        const current = values[itemId];
+        if (!current?.expanded) return values;
+        return { ...values, [itemId]: { range, points: data.items, loadedAt: new Date().toISOString(), expanded: true, pending: false } };
+      });
+    } catch (error) {
+      if (!mountedRef.current || historyRequestIdsRef.current[itemId] !== requestId) return;
+      setHistory(values => {
+        const current = values[itemId];
+        if (!current?.expanded) return values;
+        return { ...values, [itemId]: { ...current, pending: false } };
+      });
+      setMessage(toUserMessage(error));
+    }
+  }, []);
+
+  function hideHistory(itemId: string) {
+    historyRequestIdsRef.current[itemId] = (historyRequestIdsRef.current[itemId] || 0) + 1;
+    const current = historyRef.current[itemId];
+    if (current) historyRef.current = { ...historyRef.current, [itemId]: { ...current, expanded: false, pending: false } };
+    setHistory(values => {
+      const currentState = values[itemId];
+      if (!currentState) return values;
+      return { ...values, [itemId]: { ...currentState, expanded: false, pending: false } };
+    });
+  }
+
+  const loadFavorites = useCallback(async () => {
+    if (!mountedRef.current || favoritesLoadingRef.current) return;
+    favoritesLoadingRef.current = true;
+    try {
+      const data = await api<{ items: Favorite[] }>("/bili-market/favorites");
+      if (!mountedRef.current) return;
+      const previousById = new Map(itemsRef.current.map(item => [item.id, item]));
+      setItems(data.items);
+      itemsRef.current = data.items;
+      const historyRefreshes = data.items.flatMap(item => {
+        const previous = previousById.get(item.id);
+        const expanded = historyRef.current[item.id];
+        return previous && expanded?.expanded && previous.last_evaluated_at !== item.last_evaluated_at
+          ? [{ item, range: expanded.range }]
+          : [];
+      });
+      await Promise.all(historyRefreshes.map(({ item, range }) => loadHistoryData(item.id, item.cluster_id, range)));
+    } catch (error) {
+      if (mountedRef.current) setMessage(toUserMessage(error));
+    } finally {
+      favoritesLoadingRef.current = false;
+    }
+  }, [loadHistoryData]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    const stopPolling = () => {
+      if (timer !== undefined) window.clearInterval(timer);
+      timer = undefined;
+    };
+    const startPolling = () => {
+      stopPolling();
+      if (document.visibilityState === "hidden") return;
+      void loadFavorites();
+      timer = window.setInterval(() => void loadFavorites(), 4000);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") stopPolling();
+      else startPolling();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    startPolling();
+    return () => {
+      stopPolling();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [loadFavorites]);
+
+  async function update(item: Favorite, patch: Record<string, unknown>) {
+    try {
+      const next = await api<Favorite>(`/bili-market/favorites/${item.cluster_id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      setItems(values => values.map(value => value.id === item.id ? next : value));
+      itemsRef.current = itemsRef.current.map(value => value.id === item.id ? next : value);
+    } catch (error) {
+      if (isEmailVerificationRequired(error)) { setEmailVerificationRequired(true); setMessage(EMAIL_VERIFICATION_MESSAGE); }
+      else setMessage(toUserMessage(error));
+    }
+  }
+
+  async function remove(item: Favorite) {
+    if (!window.confirm("确定删除这个收藏吗？")) return;
+    try {
+      await api(`/bili-market/favorites/${item.cluster_id}`, { method: "DELETE" });
+      historyRequestIdsRef.current[item.id] = (historyRequestIdsRef.current[item.id] || 0) + 1;
+      const currentHistory = historyRef.current[item.id];
+      if (currentHistory) {
+        const nextHistory = { ...historyRef.current };
+        delete nextHistory[item.id];
+        historyRef.current = nextHistory;
+      }
+      setItems(values => values.filter(value => value.id !== item.id));
+      itemsRef.current = itemsRef.current.filter(value => value.id !== item.id);
+      setHistory(values => { const next = { ...values }; delete next[item.id]; return next; });
+    } catch (error) { setMessage(toUserMessage(error)); }
+  }
+
+  async function refresh(item: Favorite) {
+    setRefreshingId(item.id);
+    try {
+      const result = await api<Product>(`/bili-market/favorites/${item.cluster_id}/refresh`, { method: "POST" });
+      const updated = { ...item, product: result, last_manual_refresh_at: new Date().toISOString() };
+      setItems(values => values.map(value => value.id === item.id ? updated : value));
+      itemsRef.current = itemsRef.current.map(value => value.id === item.id ? updated : value);
+      const expanded = historyRef.current[item.id];
+      if (expanded?.expanded) await loadHistoryData(item.id, item.cluster_id, expanded.range);
+      onProductRefresh();
+    } catch (error) { setMessage(toUserMessage(error)); }
+    finally { setRefreshingId(null); }
+  }
+
+  function toggleHistory(item: Favorite) {
+    if (historyRef.current[item.id]?.expanded) {
+      hideHistory(item.id);
+      return;
+    }
+    void loadHistoryData(item.id, item.cluster_id, "24h");
+  }
+
+  function changeHistoryRange(item: Favorite, range: HistoryRange) {
+    void loadHistoryData(item.id, item.cluster_id, range);
+  }
+
+  return <main className="page"><div className="page-heading"><div><span className="eyebrow">MONITORING</span><h1>我的收藏</h1><p>每件商品可以独立设置目标价、邮件提醒和检查频率。</p></div><span className="count-pill">{items.length} / 20</span></div>{(!user.email_verified || emailVerificationRequired) && <div className="notice warning email-verification-notice" role="alert"><span>{EMAIL_VERIFICATION_MESSAGE}</span><button className="button outline" onClick={onOpenProfile}>前往个人资料</button></div>}{message && !emailVerificationRequired && <p className="error">{message}</p>}{items.length === 0 ? <div className="empty"><h2>还没有收藏商品</h2><p>回到查询页，粘贴商品 ID 后即可保存。</p></div> : <div className="favorite-grid">{items.map(item => { const historyState = history[item.id]; const historyExpanded = historyState?.expanded === true; const countdown = item.notify_enabled ? countdownSeconds(item.next_check_at, nowMs) : null; return <article className="favorite-card" key={item.id}><div className="favorite-head"><div className="mini-cover"><ProductImage clusterId={item.cluster_id} src={item.product.cover_url} title={item.product.title} /></div><div><h2>{item.product.title}</h2><p className="product-id">{item.cluster_id} · {item.product.available ? `¥${item.product.current_price || "—"}` : "已售罄"}</p></div></div><div className="favorite-settings"><label>目标价<input value={item.target_price || ""} placeholder="未设置" onChange={e => setItems(values => values.map(v => v.id === item.id ? { ...v, target_price: e.target.value } : v))} onBlur={e => update(item, { target_price: e.target.value ? Number(e.target.value) : null })} /></label><label>检查频率<select value={item.check_interval_seconds} onChange={e => update(item, { check_interval_seconds: Number(e.target.value) })}>{intervals.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="switch-label"><input type="checkbox" checked={item.notify_enabled} onChange={e => update(item, { notify_enabled: e.target.checked })} /><span>邮件提醒</span></label></div><p className="hint">最后检查：{formatTime(item.last_evaluated_at)} · {formatInterval(item.check_interval_seconds)}</p><p className={`next-check ${!item.notify_enabled ? "muted" : ""}`}>{!item.notify_enabled ? "自动监控未开启" : countdown === 0 ? "即将检查" : `距离下次自动检查还有 ${countdown ?? "—"} 秒`}</p>{historyExpanded && <HistoryChart points={historyState?.points || []} range={historyState?.range || "24h"} onRangeChange={range => changeHistoryRange(item, range)} loading={Boolean(historyState?.pending)} />}<div className="favorite-actions"><a className="button outline" href={item.product.detail_url} target="_blank" rel="noopener noreferrer">前往 B 站市集 ↗</a><button className="button outline" onClick={() => void refresh(item)} disabled={refreshingId === item.id}>{refreshingId === item.id ? "刷新中…" : "立即刷新"}</button><button className="button outline" onClick={() => toggleHistory(item)}>{historyExpanded ? "隐藏价格历史" : "价格历史"}</button><button className="button danger" onClick={() => void remove(item)}>删除</button></div></article>; })}</div>}</main>;
+}
+
+function EmailSuccessModal({ changing, onClose }: { changing: boolean; onClose: () => void }) {
+  const modalRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const previousFocus = document.activeElement as HTMLElement | null;
+    closeButtonRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); onClose(); }
+      if (event.key !== "Tab") return;
+      const focusable = modalRef.current?.querySelectorAll<HTMLElement>("button, [href], input, select, textarea, [tabindex]:not([tabindex=\"-1\"]):not([disabled])");
+      if (!focusable?.length) { event.preventDefault(); modalRef.current?.focus(); return; }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (!modalRef.current?.contains(active)) { event.preventDefault(); first.focus(); }
+      else if (event.shiftKey && active === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [onClose]);
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="email-success-title" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section ref={modalRef} className="modal-card" tabIndex={-1}><span className="eyebrow">EMAIL STATUS</span><h2 id="email-success-title">{changing ? "通知邮箱已更换" : "邮箱验证成功"}</h2><p>{changing ? "新邮箱已验证并锁定，后续邮件提醒将发送到新邮箱。" : "通知邮箱已验证，现在可以开启低价提醒。"}</p><button ref={closeButtonRef} className="primary" onClick={onClose}>知道了</button></section></div>;
 }
 
 function ProfilePage({ user, setUser }: { user: User; setUser: (user: User) => void }) {
-  const [email, setEmail] = useState(user.email || ""); const [code, setCode] = useState(""); const [message, setMessage] = useState(""); const [cooldown, setCooldown] = useState(0);
-  useEffect(() => { if (!cooldown) return; const timer = window.setInterval(() => setCooldown(value => Math.max(0, value - 1)), 1000); return () => window.clearInterval(timer); }, [cooldown]);
-  async function sendCode() { setMessage(""); try { await api("/profile/email/send-code", { method: "POST", body: JSON.stringify({ email }) }); setCooldown(60); setMessage("验证码已发送，请检查邮箱。"); } catch (error) { setMessage(toUserMessage(error)); } }
-  async function verify() { try { const data = await api<{ email: string; email_verified: boolean }>("/profile/email/verify", { method: "POST", body: JSON.stringify({ code }) }); setUser({ ...user, email: data.email, email_verified: data.email_verified }); setMessage("邮箱验证成功，现在可以开启邮件提醒。"); } catch (error) { setMessage(toUserMessage(error)); } }
-  return <main className="page narrow"><section className="section-heading"><span className="eyebrow">PROFILE</span><h1>个人资料</h1><p>邮箱验证后才能启用低价提醒。</p></section><section className="panel"><div className="profile-row"><span>用户名</span><strong>{user.username}</strong></div><div className="profile-row"><span>邮箱状态</span><strong className={user.email_verified ? "success-text" : "warning-text"}>{user.email_verified ? "已验证" : "未验证"}</strong></div><label>通知邮箱<input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" /></label><div className="button-row"><button className="primary" disabled={!email || cooldown > 0} onClick={sendCode}>{cooldown ? `${cooldown} 秒后可重发` : "发送验证码"}</button><input className="code-input" value={code} onChange={e => setCode(e.target.value)} placeholder="6 位验证码" maxLength={6} inputMode="numeric" /><button className="button outline" disabled={code.length !== 6} onClick={verify}>验证邮箱</button></div>{message && <p className="notice">{message}</p>}</section></main>;
+  const [email, setEmail] = useState(user.email || "");
+  const [code, setCode] = useState("");
+  const [message, setMessage] = useState("");
+  const [cooldown, setCooldown] = useState(0);
+  const [editing, setEditing] = useState(!user.email_verified);
+  const [verificationStarted, setVerificationStarted] = useState(false);
+  const [successModal, setSuccessModal] = useState<boolean | null>(null);
+  const emailInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!editing) setEmail(user.email || "");
+  }, [editing, user.email]);
+  useEffect(() => {
+    if (!editing) return;
+    const frame = window.requestAnimationFrame(() => emailInputRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [editing]);
+  useEffect(() => {
+    if (!cooldown) return;
+    const timer = window.setInterval(() => setCooldown(value => Math.max(0, value - 1)), 1000);
+    return () => window.clearInterval(timer);
+  }, [cooldown]);
+
+  function clearVerificationForm() {
+    setCode("");
+    setCooldown(0);
+    setMessage("");
+    setVerificationStarted(false);
+  }
+
+  function startChange() {
+    setEmail("");
+    clearVerificationForm();
+    setEditing(true);
+  }
+
+  function cancelChange() {
+    setEmail(user.email || "");
+    clearVerificationForm();
+    setEditing(false);
+  }
+
+  async function sendCode() {
+    setMessage("");
+    try {
+      await api("/profile/email/send-code", { method: "POST", body: JSON.stringify({ email: email.trim() }) });
+      setCooldown(60);
+      setVerificationStarted(true);
+      setMessage("验证码已发送，请检查邮箱。");
+    } catch (error) { setMessage(toUserMessage(error)); }
+  }
+
+  async function verify() {
+    const changing = user.email_verified;
+    try {
+      const data = await api<{ email: string; email_verified: boolean }>("/profile/email/verify", { method: "POST", body: JSON.stringify({ code }) });
+      setUser({ ...user, email: data.email, email_verified: data.email_verified });
+      setEmail(data.email);
+      clearVerificationForm();
+      setEditing(false);
+      setSuccessModal(changing);
+    } catch (error) { setMessage(toUserMessage(error)); }
+  }
+
+  return <main className="page narrow"><section className="section-heading"><span className="eyebrow">PROFILE</span><h1>个人资料</h1><p>邮箱验证后才能启用低价提醒。</p></section><section className="panel"><div className="profile-row"><span>用户名</span><strong>{user.username}</strong></div><div className="profile-row"><span>邮箱状态</span><strong className={user.email_verified ? "success-text" : "warning-text"}>{user.email_verified ? "已验证且有效" : "未验证"}</strong></div><label>通知邮箱<input ref={emailInputRef} type="email" value={editing ? email : user.email || ""} readOnly={!editing} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" aria-describedby={user.email_verified && editing ? "email-change-hint" : undefined} /></label>{user.email_verified && !editing ? <div className="profile-actions"><p className="hint">当前邮箱已验证并正常接收提醒。</p><button type="button" className="button outline" onClick={startChange}>更换邮箱</button></div> : <div className="verification-area">{user.email_verified && <p id="email-change-hint" className="notice">当前已验证邮箱：{user.email}。验证新邮箱前，旧邮箱仍保持已验证并继续有效。</p>}<div className="button-row"><button type="button" className="primary" disabled={!email.trim() || cooldown > 0} onClick={() => void sendCode()}>{cooldown ? `${cooldown} 秒后可重发` : "发送验证码"}</button>{user.email_verified && <button type="button" className="button ghost" onClick={cancelChange}>取消更换</button>}</div>{verificationStarted && <div className="button-row"><input className="code-input" value={code} onChange={event => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位验证码" maxLength={6} inputMode="numeric" aria-label="邮箱验证码" /><button type="button" className="button outline" disabled={code.length !== 6} onClick={() => void verify()}>验证邮箱</button></div>}{message && <p className="notice" role="status" aria-live="polite">{message}</p>}</div>}</section>{successModal !== null && <EmailSuccessModal changing={successModal} onClose={() => setSuccessModal(null)} />}</main>;
 }
 
 function TutorialPage({ onBack }: { onBack: () => void }) {
