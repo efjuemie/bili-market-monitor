@@ -23,6 +23,40 @@ def test_available_parser_uses_purchase_button_and_normalizes_urls():
     assert snapshot.detail_url.endswith("clusterId=10000002733")
 
 
+def test_live_response_uses_share_title_and_cover_and_preserves_sold_out_price():
+    snapshot = parse_cluster_info(load("live_10000002733.json"), 10000002733)
+    assert snapshot.title == "TAITO T-most 更衣人偶坠入爱河 喜多川海梦 利兹Ver. 景品手办 规格：喜多川海梦 利兹Ver."
+    assert snapshot.cover_url == "https://i0.hdslb.com/bfs/mall/mall/9a/09/9a09e1792a33122850aae44a0beb0561.png"
+    assert snapshot.detail_url.endswith("clusterId=10000002733")
+    assert snapshot.available is False
+    assert snapshot.current_price is None
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "//i0.hdslb.com/bfs/mall/cover.jpg",
+        {"url": "//i0.hdslb.com/bfs/mall/cover.jpg"},
+        {"src": "//i0.hdslb.com/bfs/mall/cover.jpg"},
+        {"imageUrl": "//i0.hdslb.com/bfs/mall/cover.jpg"},
+    ],
+)
+def test_cover_url_accepts_protocol_relative_string_and_object_shapes(image):
+    payload = {
+        "code": 0,
+        "data": {
+            "clusterHeaderFloorVO": {"clusterImgList": [image]},
+            "clusterPurchaseButton": {
+                "buttonText": "最低价",
+                "buttonPriceDescVO": {"priceIntegerPart": "129"},
+                "buttonDisabled": False,
+            },
+        },
+    }
+    snapshot = parse_cluster_info(payload, 10000002733)
+    assert snapshot.cover_url == "https://i0.hdslb.com/bfs/mall/cover.jpg"
+
+
 def test_sold_out_parser_never_uses_recent_deal_as_current_price():
     snapshot = parse_cluster_info(load("sold_out.json"), 10000011281)
     assert snapshot.available is False

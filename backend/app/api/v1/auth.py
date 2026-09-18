@@ -1,3 +1,5 @@
+import logging
+import smtplib
 from datetime import timedelta
 from uuid import uuid4
 
@@ -17,6 +19,12 @@ from app.schemas import ForgotPasswordRequest, LoginRequest, RegisterRequest, Re
 from app.services.mailer import Mailer, reset_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
+
+
+def _mask_email(email: str) -> str:
+    local, _, domain = email.partition("@")
+    return f"{local[:1]}***@{domain}" if domain else "***"
 
 
 def public_user(user: User) -> dict:
@@ -122,13 +130,29 @@ def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Sessio
     if not user or not user.email or not user.email_verified_at or user.email.lower() != str(payload.email).lower():
         return generic
     now = utcnow()
+    # Revoke prior reset links in a separate transaction so a failed delivery
+    # cannot roll that revocation back and revive an old link.
     db.execute(delete(PasswordResetToken).where(PasswordResetToken.user_id == user.id, PasswordResetToken.used_at.is_(None)))
+    db.commit()
     token = new_token()
     db.add(PasswordResetToken(id=str(uuid4()), user_id=user.id, token_hash=hash_token(token), expires_at=now + timedelta(minutes=settings.password_reset_ttl_minutes), created_at=now))
-    db.commit()
     link = f"{settings.app_base_url.rstrip('/')}/reset-password?token={token}"
     subject, text, html = reset_email(settings, user.email, link)
-    Mailer(settings).send(user.email, subject, text, html)
+    try:
+        sent = Mailer(settings).send(user.email, subject, text, html)
+    except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+        db.rollback()
+        logger.warning(
+            "Password reset delivery failed recipient=%s exception=%s",
+            _mask_email(user.email),
+            type(exc).__name__,
+        )
+        return generic
+    if not sent:
+        db.rollback()
+        logger.warning("Password reset delivery skipped recipient=%s reason=mailer_false", _mask_email(user.email))
+        return generic
+    db.commit()
     return generic
 
 

@@ -1,0 +1,23 @@
+{
+  "success": true,
+  "data": {
+    "clusterHeaderFloorVO": {
+      "clusterImgList": [
+        "//i0.hdslb.com/bfs/mall/mall/9a/09/9a09e1792a33122850aae44a0beb0561.png"
+      ],
+      "header": [
+        {
+          "shareExtra": {
+            "title": "TAITO T-most 更衣人偶坠入爱河 喜多川海梦 利兹Ver. 景品手办 规格：喜多川海梦 利兹Ver.",
+            "url": "/neul-next/resell/detail.html?clusterId=10000002733",
+            "imageUrl": "//i0.hdslb.com/bfs/mall/mall/9a/09/9a09e1792a33122850aae44a0beb0561.png"
+          }
+        }
+      ]
+    },
+    "clusterPurchaseButton": {
+      "buttonText": "已售罄",
+      "buttonDisabled": true
+    }
+  }
+}

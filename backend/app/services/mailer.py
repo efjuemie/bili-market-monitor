@@ -17,7 +17,7 @@ class Mailer:
         if not self.settings.smtp_enabled:
             # Development can exercise the full outbox state machine without
             # accidentally sending mail. Production should configure SMTP.
-            logger.warning("SMTP is not configured; email delivery skipped recipient=%s", self._mask_email(recipient))
+            logger.warning("SMTP delivery skipped recipient=%s reason=not_configured", self._mask_email(recipient))
             return False
         message = EmailMessage()
         message["Subject"] = subject
@@ -26,12 +26,24 @@ class Mailer:
         message.set_content(text_body)
         if html_body:
             message.add_alternative(html_body, subtype="html")
-        with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port, timeout=20) as server:
-            if self.settings.smtp_use_tls:
-                server.starttls()
-            if self.settings.smtp_username:
-                server.login(self.settings.smtp_username, self.settings.smtp_password)
-            server.send_message(message)
+        try:
+            if self.settings.smtp_use_ssl:
+                server_factory = smtplib.SMTP_SSL
+            else:
+                server_factory = smtplib.SMTP
+            with server_factory(self.settings.smtp_host, self.settings.smtp_port, timeout=20) as server:
+                if self.settings.smtp_use_tls:
+                    server.starttls()
+                if self.settings.smtp_username:
+                    server.login(self.settings.smtp_username, self.settings.smtp_password)
+                server.send_message(message)
+        except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+            logger.warning(
+                "SMTP delivery failed recipient=%s exception=%s",
+                self._mask_email(recipient),
+                type(exc).__name__,
+            )
+            raise
         return True
 
     @staticmethod

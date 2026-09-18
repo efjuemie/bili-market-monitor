@@ -49,6 +49,7 @@ input.input-error:focus { border-color: #d94b5b !important; box-shadow: 0 0 0 3p
 .product-top { display: flex; gap: 22px; }
 .cover-wrap { width: 180px; height: 180px; flex: 0 0 180px; border-radius: 12px; overflow: hidden; background: #eef4f8; }
 .cover-wrap img, .mini-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.product-image-placeholder { width: 100%; height: 100%; display: grid; place-items: center; padding: 10px; text-align: center; color: #8490a5; background: #eef4f8; font-size: 13px; }
 .cover-placeholder { height: 100%; display: grid; place-items: center; color: #00aeec; font-weight: 800; font-size: 22px; }
 .product-info { min-width: 0; flex: 1; }
 .product-id { color: #99a3b4; font-size: 12px; margin: 0 0 8px; }
@@ -63,6 +64,8 @@ input.input-error:focus { border-color: #d94b5b !important; box-shadow: 0 0 0 3p
 .status.sold { background: #f1f3f7; color: #8791a4; }
 .notice { color: #68758b; background: #f7f9fc; border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 .notice.warning { color: #a16a2e; background: #fff8e8; }
+.email-verification-notice { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 0 0 20px; }
+.email-verification-notice .button { flex: 0 0 auto; }
 .product-actions, .favorite-actions, .button-row { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
 .product-actions { border-top: 1px solid #eef1f5; padding-top: 16px; margin-top: 20px; }
 .monitor-panel { border-top: 1px solid #eef1f5; margin-top: 20px; padding-top: 20px; }
@@ -76,6 +79,7 @@ label { color: #5c687d; font-size: 13px; display: grid; gap: 7px; }
 .help-card { background: #e9f8fd; border: 1px solid #c8eff9; }
 .help-card h2 { margin: 7px 0 6px; font-size: 19px; }
 .help-card p, .signin-prompt p { color: #6e7b90; margin-bottom: 0; font-size: 13px; }
+.help-actions { display: flex; flex-wrap: wrap; gap: 9px; flex: 0 0 auto; }
 .signin-prompt { background: #fff; border: 1px solid #e3e8f0; }
 .signin-prompt h3 { margin: 0 0 5px; }
 .page-heading { display: flex; align-items: end; justify-content: space-between; margin-bottom: 28px; }
@@ -104,8 +108,19 @@ label { color: #5c687d; font-size: 13px; display: grid; gap: 7px; }
 .code-input { max-width: 160px; }
 .auth-page { display: grid; place-items: center; min-height: 600px; }
 .auth-card { width: min(100%, 430px); padding: 28px; box-shadow: 0 14px 35px rgba(31,50,81,.06); }
+.tutorial-page { max-width: 980px; min-width: 0; }
+.tutorial-intro { text-align: center; max-width: 760px; margin: 0 auto 32px; }
+.tutorial-intro h1 { margin: 12px 0; font-size: clamp(30px, 4vw, 46px); letter-spacing: -.04em; line-height: 1.15; overflow-wrap: anywhere; }
+.tutorial-intro p { color: #7d899d; margin: 0; overflow-wrap: anywhere; }
+.tutorial-steps { display: grid; gap: 18px; }
+.tutorial-step { min-width: 0; background: #fff; border: 1px solid #e3e8f0; border-radius: 15px; padding: 22px; box-shadow: 0 10px 28px rgba(31,50,81,.04); }
+.tutorial-step h2 { margin: 6px 0 8px; font-size: 21px; }
+.tutorial-step p { color: #6e7b90; margin-bottom: 17px; }
+.tutorial-step img { display: block; width: 100%; max-width: 100%; height: auto; border: 1px solid #e6ebf2; border-radius: 10px; }
+.step-number { color: #00a6df; font-size: 12px; font-weight: 800; letter-spacing: .08em; }
+.tutorial-actions { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; margin-top: 26px; }
 .stack { display: grid; gap: 15px; }.auth-links { display: flex; justify-content: space-between; margin-top: 20px; }.auth-links button { background: transparent; color: #00a0d5; font-size: 13px; padding: 0; }
 .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 13px; margin-bottom: 25px; }.stats-grid > div { background: #fff; border: 1px solid #e3e8f0; border-radius: 12px; padding: 17px; }.stats-grid span, .stats-grid small { display: block; color: #8b96a8; font-size: 12px; }.stats-grid strong { display: block; font-size: 28px; margin: 6px 0; color: #344158; }
 .table-wrap { overflow-x: auto; } table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { padding: 12px 8px; border-bottom: 1px solid #eef1f5; text-align: left; white-space: nowrap; } th { color: #8b96a8; font-weight: 600; }.table-button { background: transparent; color: #00a0d5; margin-right: 8px; padding: 4px; font-size: 12px; }.panel-title-row { display: flex; justify-content: space-between; align-items: center; }.detail-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; color: #5c687d; font-size: 13px; }
 footer { width: min(1280px, calc(100% - clamp(28px, 5vw, 72px))); margin: 0 auto; border-top: 1px solid #e3e8f0; padding: 20px 0 28px; display: flex; justify-content: space-between; color: #99a3b4; font-size: 12px; gap: 16px; } footer a { color: #00a0d5; text-decoration: none; }
-@media (max-width: 760px) { .topbar { height: auto; min-height: 64px; padding: 12px 16px; flex-wrap: wrap; gap: 9px; }.brand { min-width: auto; flex: 1; }.brand strong { font-size: 13px; }.account { order: 1; }.topbar nav { order: 2; width: 100%; height: 37px; overflow-x: auto; }.topbar nav button { padding: 0 10px; font-size: 12px; }.page { width: min(100% - 28px, 680px); padding-top: 38px; }.hero { padding-top: 10px; }.hero h1 { font-size: 35px; }.search-form { flex-direction: column; }.search-form .primary { width: 100%; }.product-card { padding: 15px; }.product-top { gap: 13px; }.cover-wrap { width: 96px; height: 96px; flex-basis: 96px; }.product-info h2 { font-size: 16px; margin-bottom: 9px; }.price { font-size: 25px; }.monitor-fields { grid-template-columns: 1fr; }.help-card, .signin-prompt { align-items: flex-start; flex-direction: column; padding: 18px; }.help-card .button, .signin-prompt .button { width: 100%; }.favorite-grid { grid-template-columns: 1fr; }.page-heading h1 { font-size: 31px; }.stats-grid { grid-template-columns: repeat(2, 1fr); }.button-row { align-items: stretch; }.button-row > * { flex: 1; }.code-input { max-width: none; } footer { width: calc(100% - 28px); flex-direction: column; } }
+@media (max-width: 760px) { .topbar { height: auto; min-height: 64px; padding: 12px 16px; flex-wrap: wrap; gap: 9px; }.brand { min-width: auto; flex: 1; }.brand strong { font-size: 13px; }.account { order: 1; }.topbar nav { order: 2; width: 100%; height: 37px; overflow-x: auto; }.topbar nav button { padding: 0 10px; font-size: 12px; }.page { width: min(100% - 28px, 680px); padding-top: 38px; }.hero { padding-top: 10px; }.hero h1 { font-size: 35px; }.search-form { flex-direction: column; }.search-form .primary { width: 100%; }.product-card { padding: 15px; }.product-top { gap: 13px; }.cover-wrap { width: 96px; height: 96px; flex-basis: 96px; }.product-info h2 { font-size: 16px; margin-bottom: 9px; }.price { font-size: 25px; }.monitor-fields { grid-template-columns: 1fr; }.help-card, .signin-prompt { align-items: flex-start; flex-direction: column; padding: 18px; }.help-actions { width: 100%; }.help-card .button, .signin-prompt .button { width: 100%; }.email-verification-notice { align-items: stretch; flex-direction: column; }.email-verification-notice .button { width: 100%; }.favorite-grid { grid-template-columns: 1fr; }.page-heading h1 { font-size: 31px; }.stats-grid { grid-template-columns: repeat(2, 1fr); }.button-row { align-items: stretch; }.button-row > * { flex: 1; }.code-input { max-width: none; }.tutorial-step { padding: 16px; }.tutorial-step h2 { font-size: 19px; } footer { width: calc(100% - 28px); flex-direction: column; } }

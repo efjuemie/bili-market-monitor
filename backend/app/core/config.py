@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_base_url: str = "http://localhost:5173"
     app_timezone: str = "Asia/Shanghai"
-    version: str = "0.1.2"
+    version: str = "0.1.3"
     database_url: str = "sqlite:///./app.db"
 
     session_cookie_name: str = "session"
@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     smtp_from_email: str = ""
     smtp_from_name: str = "B站市集好价提示系统"
     smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
     smtp_unconfigured_max_attempts: int = Field(default=3, ge=1, le=10)
 
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")
@@ -60,6 +61,12 @@ class Settings(BaseSettings):
     @property
     def smtp_enabled(self) -> bool:
         return bool(self.smtp_host and self.smtp_username and self.smtp_password and self.smtp_from_email)
+
+    @model_validator(mode="after")
+    def validate_smtp_security(self) -> "Settings":
+        if self.smtp_use_ssl and self.smtp_use_tls:
+            raise ValueError("SMTP_USE_SSL 与 SMTP_USE_TLS 不能同时为 true")
+        return self
 
 
 @lru_cache

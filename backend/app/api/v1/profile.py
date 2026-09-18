@@ -1,3 +1,5 @@
+import logging
+import smtplib
 from datetime import timedelta
 from uuid import uuid4
 
@@ -15,6 +17,15 @@ from app.schemas import EmailCodeRequest, VerifyEmailRequest
 from app.services.mailer import Mailer, verification_email
 
 router = APIRouter(prefix="/profile", tags=["profile"])
+logger = logging.getLogger(__name__)
+
+EMAIL_SERVICE_UNAVAILABLE = "验证码暂时无法发送，请稍后重试。"
+EMAIL_SEND_FAILED = "验证码发送失败，请稍后重试。"
+
+
+def _mask_email(email: str) -> str:
+    local, _, domain = email.partition("@")
+    return f"{local[:1]}***@{domain}" if domain else "***"
 
 
 @router.get("")
@@ -33,6 +44,8 @@ def profile(user: User = Depends(get_current_user)) -> dict:
 @router.post("/email/send-code")
 def send_email_code(payload: EmailCodeRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user), settings: Settings = Depends(get_settings)) -> dict:
     email = str(payload.email).strip().lower()
+    if not settings.smtp_enabled:
+        raise AppError("EMAIL_SERVICE_UNAVAILABLE", EMAIL_SERVICE_UNAVAILABLE, 503)
     now = utcnow()
     hourly_count = db.scalar(select(func.count()).select_from(EmailVerificationChallenge).where(EmailVerificationChallenge.user_id == user.id, EmailVerificationChallenge.created_at >= now - timedelta(hours=1))) or 0
     if hourly_count >= 5:
@@ -40,8 +53,10 @@ def send_email_code(payload: EmailCodeRequest, db: Session = Depends(get_db), us
     latest = db.scalar(select(EmailVerificationChallenge).where(EmailVerificationChallenge.user_id == user.id).order_by(desc(EmailVerificationChallenge.created_at)).limit(1))
     if latest and (now - (latest.created_at.replace(tzinfo=now.tzinfo) if latest.created_at.tzinfo is None else latest.created_at)).total_seconds() < settings.email_verify_resend_cooldown_seconds:
         raise AppError("EMAIL_CODE_RESEND_COOLDOWN", "验证码发送过于频繁，请稍后再试", 429)
-    # New code immediately invalidates prior challenges for this user.
+    # Invalidate prior challenges in a separate transaction. If delivery fails,
+    # the old code must stay invalid while the new, unsent challenge rolls back.
     db.execute(update(EmailVerificationChallenge).where(EmailVerificationChallenge.user_id == user.id, EmailVerificationChallenge.used_at.is_(None)).values(used_at=now))
+    db.commit()
     code = new_code()
     challenge = EmailVerificationChallenge(
         id=str(uuid4()), user_id=user.id, pending_email=email, code_hash=hash_password(code),
@@ -49,9 +64,22 @@ def send_email_code(payload: EmailCodeRequest, db: Session = Depends(get_db), us
         attempts=0, created_at=now,
     )
     db.add(challenge)
-    db.commit()
     subject, text, html = verification_email(settings, email, code)
-    Mailer(settings).send(email, subject, text, html)
+    try:
+        sent = Mailer(settings).send(email, subject, text, html)
+    except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+        db.rollback()
+        logger.warning(
+            "Email verification delivery failed recipient=%s exception=%s",
+            _mask_email(email),
+            type(exc).__name__,
+        )
+        raise AppError("EMAIL_SEND_FAILED", EMAIL_SEND_FAILED, 502) from exc
+    if not sent:
+        db.rollback()
+        logger.warning("Email verification delivery skipped recipient=%s reason=mailer_false", _mask_email(email))
+        raise AppError("EMAIL_SEND_FAILED", EMAIL_SEND_FAILED, 502)
+    db.commit()
     return {"message": "验证码已发送，请检查邮箱"}
 
 

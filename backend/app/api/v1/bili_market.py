@@ -1,8 +1,10 @@
+import logging
 from datetime import timedelta
 from typing import Any, Dict
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import Response
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -14,6 +16,7 @@ from app.core.security import utcnow
 from app.errors import AppError
 from app.models import BiliFavorite, BiliPriceHistory, BiliProduct, NotificationOutbox, User
 from app.schemas import FavoriteCreateRequest, FavoriteUpdateRequest
+from app.services.bili_market.cover import COVER_CACHE_CONTROL, CoverProxyError, fetch_cover
 from app.services.bili_market.service import (
     ProductService,
     iso,
@@ -23,6 +26,7 @@ from app.services.bili_market.service import (
 )
 
 router = APIRouter(prefix="/bili-market", tags=["bili-market"])
+logger = logging.getLogger(__name__)
 
 
 def product_service(request: Request, settings: Settings = Depends(get_settings)) -> ProductService:
@@ -53,6 +57,26 @@ async def get_product(cluster_id: int, db: Session = Depends(get_db), service: P
     return product_response(product)
 
 
+@router.get("/products/{cluster_id}/cover")
+async def get_product_cover(cluster_id: int, db: Session = Depends(get_db)) -> Response:
+    product = db.scalar(select(BiliProduct).where(BiliProduct.cluster_id == validate_cluster_id(cluster_id)))
+    if product is None:
+        raise AppError("PRODUCT_COVER_NOT_FOUND", "未找到商品封面", 404)
+    try:
+        cover = await fetch_cover(product.cover_url)
+    except CoverProxyError as exc:
+        logger.warning("Product cover proxy failed cluster_id=%s code=%s", cluster_id, exc.code)
+        raise AppError(exc.code, exc.message, exc.status_code) from exc
+    return Response(
+        content=cover.content,
+        media_type=cover.content_type,
+        headers={
+            "Cache-Control": COVER_CACHE_CONTROL,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.get("/favorites")
 def list_favorites(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
     favorites = db.scalars(select(BiliFavorite).where(BiliFavorite.user_id == user.id).order_by(BiliFavorite.created_at.desc())).all()
@@ -62,7 +86,7 @@ def list_favorites(user: User = Depends(get_current_user), db: Session = Depends
 @router.post("/favorites")
 async def create_favorite(payload: FavoriteCreateRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user), service: ProductService = Depends(product_service)) -> Dict[str, Any]:
     if payload.notify_enabled and user.email_verified_at is None:
-        raise AppError("EMAIL_VERIFICATION_REQUIRED", "开启邮件提醒前请先验证邮箱", 400)
+        raise AppError("EMAIL_VERIFICATION_REQUIRED", "开启邮件提醒前，请先前往“个人资料”绑定并验证通知邮箱。", 400)
     if payload.notify_enabled and payload.target_price is None:
         raise AppError("INVALID_TARGET_PRICE", "开启邮件提醒必须设置目标价格", 422)
     product = await service.fetch_and_persist(db, validate_cluster_id(payload.cluster_id))
@@ -102,7 +126,7 @@ def update_favorite(cluster_id: int, payload: FavoriteUpdateRequest, db: Session
     if payload.notify_enabled is not None:
         target_price = payload.target_price if "target_price" in payload.model_fields_set else favorite.target_price
         if payload.notify_enabled and user.email_verified_at is None:
-            raise AppError("EMAIL_VERIFICATION_REQUIRED", "开启邮件提醒前请先验证邮箱", 400)
+            raise AppError("EMAIL_VERIFICATION_REQUIRED", "开启邮件提醒前，请先前往“个人资料”绑定并验证通知邮箱。", 400)
         if payload.notify_enabled and target_price is None:
             raise AppError("INVALID_TARGET_PRICE", "开启邮件提醒必须设置目标价格", 422)
         favorite.notify_enabled = payload.notify_enabled

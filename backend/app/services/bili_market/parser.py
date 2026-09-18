@@ -33,8 +33,15 @@ def _decimal(value: Any) -> Optional[Decimal]:
 
 
 def _url(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        for key in ("url", "src", "imageUrl"):
+            url = _url(value.get(key))
+            if url:
+                return url
+        return None
     if not value or not isinstance(value, str):
         return None
+    value = value.strip()
     if value.startswith("//"):
         return "https:" + value
     if value.startswith("/"):
@@ -107,11 +114,28 @@ def parse_cluster_info(payload: Dict[str, Any], cluster_id: int) -> BiliProductS
 
     header = root.get("clusterHeaderFloorVO") or {}
     image_list = header.get("clusterImgList") or []
-    first_image = image_list[0] if image_list else None
-    if isinstance(first_image, dict):
-        first_image = first_image.get("url") or first_image.get("src")
+    first_image = image_list[0] if isinstance(image_list, (list, tuple)) and image_list else image_list
     cover_url = _url(first_image)
+    header_items = header.get("header") or []
+    if isinstance(header_items, dict):
+        header_items = [header_items]
+    share_extras = [
+        item.get("shareExtra")
+        for item in header_items
+        if isinstance(item, dict) and isinstance(item.get("shareExtra"), dict)
+    ]
+    share_extra_title = None
+    for extra in share_extras:
+        share_extra_title = _first_text(extra.get("title"))
+        if share_extra_title:
+            break
+    if cover_url is None:
+        for extra in share_extras:
+            cover_url = _url(extra.get("imageUrl"))
+            if cover_url:
+                break
     title = _first_text(
+        share_extra_title,
         header.get("title"),
         header.get("clusterName"),
         root.get("clusterName"),
@@ -119,15 +143,10 @@ def parse_cluster_info(payload: Dict[str, Any], cluster_id: int) -> BiliProductS
     ) or f"B站市集商品 {cluster_id}"
 
     detail_url = None
-    header_items = header.get("header") or []
-    if isinstance(header_items, dict):
-        header_items = [header_items]
-    for item in header_items:
-        if isinstance(item, dict):
-            extra = item.get("shareExtra") or {}
-            detail_url = _url(extra.get("url"))
-            if detail_url:
-                break
+    for extra in share_extras:
+        detail_url = _url(extra.get("url"))
+        if detail_url:
+            break
     detail_url = detail_url or f"https://mall.bilibili.com/neul-next/resell/detail.html?clusterId={cluster_id}"
 
     recent = root.get("clusterRecentBuyFloorVO") or {}
