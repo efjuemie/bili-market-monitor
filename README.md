@@ -1,6 +1,6 @@
 # B站市集好价提示系统（Bili Market Monitor）
 
-`0.1.3` 是一个面向多用户的响应式 B 站市集价格监控工具。用户可以粘贴商品 `ClsId`（也就是 B 站接口使用的 `clusterId`），查询当前最低可购买价，收藏商品并按目标价格接收邮件提醒。查询结果和收藏卡片都会提供“前往 B 站市集”入口，方便在提醒或查询后浏览确认。
+`0.1.4` 是一个面向多用户的响应式 B 站市集价格监控工具。用户可以粘贴商品 `ClsId`（也就是 B 站接口使用的 `clusterId`），查询当前最低可购买价，收藏商品并按目标价格接收邮件提醒。查询结果和收藏卡片都会提供“前往 B 站市集”入口，方便在提醒或查询后浏览确认。
 
 ## 先找到商品 ID
 
@@ -64,11 +64,47 @@ pnpm dev
 
 ```bash
 cp .env.example .env
-# 修改 .env 中的 SMTP 和生产域名配置
-docker compose up --build
+# 编辑本机 .env 中的 SMTP 和生产域名配置
+docker compose up -d --build
 ```
 
 生产环境应在反向代理（例如 Caddy）中启用 HTTPS，并将 `SESSION_COOKIE_SECURE=true`。数据库迁移由 API 容器启动命令执行，Worker 等待 API 健康后再启动；正式环境也建议在发布流程中单独执行迁移并备份 PostgreSQL。
+
+### 163 SMTP 配置与验收
+
+部署时只在服务器本机创建和编辑 `.env`：
+
+1. 在仓库根目录执行 `cp .env.example .env`。
+2. 打开 `.env`，填写 163 邮箱账号，并将 `SMTP_FROM_EMAIL` 设置为该发件地址；`SMTP_PASSWORD` 必须填写 163 邮箱后台生成的“客户端授权码”。示例（全部是占位值）：
+
+   ```dotenv
+   SMTP_HOST=smtp.163.com
+   SMTP_PORT=465
+   SMTP_USERNAME=your-name@163.com
+   SMTP_PASSWORD=your-163-client-authorization-code
+   SMTP_FROM_EMAIL=your-name@163.com
+   SMTP_USE_SSL=true
+   SMTP_USE_TLS=false
+   ```
+
+   `SMTP_PASSWORD` 绝对不能填写 163 网页登录密码。465 端口使用 SSL，因此保持 `SMTP_USE_SSL=true`、`SMTP_USE_TLS=false`，两者不能同时开启。不要把真实邮箱、密码或授权码粘贴到聊天、Issue、日志或 Git 提交中。
+3. 确认 `.env` 未被 Git 跟踪（仓库 `.gitignore` 已忽略它），可运行 `git check-ignore -v .env` 验证忽略规则，再用 `git status --short` 检查待提交文件；`.env` 只能留在部署机，不能提交到 GitHub。若凭据曾出现在聊天、Issue、日志或 Git 提交中，应立即在 163 后台撤销并重新生成客户端授权码；若泄露的是网页登录密码，也应同时更换密码。
+4. 首次部署执行 `docker compose up -d --build`。修改 SMTP 配置后，强制重建并重启 API、Worker，使新环境变量生效：
+
+   ```bash
+   docker compose up -d --build --force-recreate api worker
+   ```
+
+5. 检查服务健康和日志：
+
+   ```bash
+   curl -fsS http://localhost:8000/api/health
+   docker compose ps
+   docker compose logs --tail=100 api worker
+   ```
+
+   健康接口应返回版本和数据库状态；日志只会记录收件人掩码及异常类型，不会输出 SMTP 密码或验证码。若使用 HTTPS 域名，请将 `localhost:8000` 替换为实际 API 地址。
+6. 使用一个可接收邮件的测试邮箱完成注册验证码或“忘记密码”流程，检查收件箱和垃圾邮件文件夹；随后再用已验证账号创建一条低价提醒。以实际收到邮件为最终验收标准；若未收到，再检查 Worker 日志和管理员 Outbox 的待发送或失败记录。不要仅凭 API 返回成功判断邮件已送达。
 
 ## 环境变量重点
 
@@ -115,10 +151,10 @@ alembic upgrade head
 
 `GET /api/health` 用于容器健康检查，会返回版本和数据库状态。B 站接口异常时会保留最近一次成功价格，不会把网络失败误判为售罄；管理员系统状态页会展示最近错误、429 和 Outbox 积压。
 
-管理员 Dashboard 的 B 站成功率按近 24 小时商品快照统计，Worker 周期耗时和客户端请求指标来自最近一次心跳；0.1.3 暂不持久化逐请求的一小时指标明细。
+管理员 Dashboard 的 B 站成功率按近 24 小时商品快照统计，Worker 周期耗时和客户端请求指标来自最近一次心跳；0.1.4 暂不持久化逐请求的一小时指标明细。
 
 生产数据库建议在迁移前后进行 PostgreSQL `pg_dump` 备份。不要把 `.env`、SMTP 授权码、密码、验证码或 Token 提交到 Git。
 
 ## 版本
 
-版本唯一来源是根目录 `VERSION`，当前为 `0.1.3`。发布 Tag 使用 `v0.1.3` 格式。版本策略遵循语义化版本：修复类更新递增补丁位；大更新递增中间位并将补丁位归零（例如 `0.1.3` → `0.2.0`）。
+版本唯一来源是根目录 `VERSION`，当前为 `0.1.4`。发布 Tag 使用 `v0.1.4` 格式。版本策略遵循语义化版本：修复类更新递增补丁位；大更新递增中间位并将补丁位归零（例如 `0.1.4` → `0.2.0`）。
