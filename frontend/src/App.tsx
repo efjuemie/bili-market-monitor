@@ -297,6 +297,10 @@ function notificationPage(actionUrl: string | null | undefined) {
   }
 }
 
+function BellIcon() {
+  return <svg className="notification-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" /><path d="M13.73 21a2 2 0 0 1-3.46 0" /></svg>;
+}
+
 function NotificationBell({ onNavigate }: { onNavigate: (page: string, actionUrl?: string) => void }) {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<SiteNotification[]>([]);
@@ -398,7 +402,7 @@ function NotificationBell({ onNavigate }: { onNavigate: (page: string, actionUrl
 
   return <div className="notification-center">
     <button type="button" className="notification-button" aria-label={unreadCount ? `通知，${unreadCount} 条未读` : "通知"} aria-expanded={open} onClick={() => { setOpen(value => !value); if (!open) void loadList(); }}>
-      <span aria-hidden="true">🔔</span>{unreadCount > 0 && <span className="notification-badge">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+      <BellIcon />{unreadCount > 0 && <span className="notification-badge">{unreadCount > 99 ? "99+" : unreadCount}</span>}
     </button>
     {open && <section className="notification-popover" aria-label="通知中心">
       <div className="notification-heading"><strong>通知中心</strong><button type="button" className="table-button" onClick={() => void markAllRead()} disabled={!unreadCount}>全部已读</button></div>
