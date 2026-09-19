@@ -15,6 +15,7 @@ from app.errors import AppError
 from app.models import EmailVerificationChallenge, NotificationOutbox, User
 from app.schemas import EmailCodeRequest, VerifyEmailRequest
 from app.services.mailer import Mailer, verification_email
+from app.services.notifications import create_site_notification
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 logger = logging.getLogger(__name__)
@@ -103,10 +104,25 @@ def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db), use
             challenge.used_at = now
         db.commit()
         raise AppError("EMAIL_CODE_INVALID", "验证码无效", 400)
+    was_verified = user.email_verified_at is not None
     user.email = challenge.pending_email
     user.email_verified_at = now
     user.updated_at = now
     challenge.used_at = now
     db.query(NotificationOutbox).filter(NotificationOutbox.user_id == user.id, NotificationOutbox.status == "pending").update({"recipient_email": user.email}, synchronize_session=False)
+    kind = "email_changed" if was_verified else "email_verified"
+    title = "通知邮箱已更换" if was_verified else "通知邮箱绑定成功"
+    body = f"新的通知邮箱{_mask_email(user.email)}已验证并生效。" if was_verified else f"{_mask_email(user.email)}已完成验证，低价邮件提醒现在可以正常发送。"
+    create_site_notification(
+        db,
+        target_user_id=user.id,
+        kind=kind,
+        severity="success",
+        title=title,
+        body=body,
+        action_url="/profile",
+        source="profile",
+        source_key=f"email-{'changed' if was_verified else 'verified'}:{challenge.id}",
+    )
     db.commit()
     return {"message": "邮箱验证成功", "email": user.email, "email_verified": True}

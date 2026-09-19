@@ -6,6 +6,8 @@ from datetime import timedelta
 from typing import Dict, List, Tuple
 
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -13,16 +15,18 @@ from app.core.database import SessionLocal
 from app.core.security import utcnow
 from app.models import (
     BiliFavorite,
-    BiliPriceHistory,
     BiliProduct,
     BiliRequestEvent,
     NotificationOutbox,
     User,
+    UserUsageDaily,
     WorkerHeartbeat,
 )
 from app.services.bili_market.client import BiliMarketClient
+from app.services.bili_market.history_compaction import compact_and_prune_history
 from app.services.bili_market.service import ProductService
 from app.services.mailer import Mailer, price_alert_email
+from app.services.notifications import create_site_notification, prune_notifications
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -39,10 +43,25 @@ def _unlock_cycle(db: Session) -> None:
         db.execute(text("SELECT pg_advisory_unlock(81423701)"))
 
 
-def _heartbeat(db: Session, client: BiliMarketClient, cycle_duration_ms: float | None = None) -> None:
+def _heartbeat(
+    db: Session,
+    client: BiliMarketClient,
+    cycle_duration_ms: float | None = None,
+    compaction_stats: dict | None = None,
+) -> None:
     row = db.get(WorkerHeartbeat, "monitor")
     now = utcnow()
     metrics = {"tick_seconds": 1, **client.metrics()}
+    previous_metrics = {}
+    if row and row.metadata_json:
+        try:
+            previous_metrics = json.loads(row.metadata_json)
+        except (TypeError, ValueError):
+            previous_metrics = {}
+    if compaction_stats is None and previous_metrics.get("price_history_compaction"):
+        metrics["price_history_compaction"] = previous_metrics["price_history_compaction"]
+    elif compaction_stats is not None:
+        metrics["price_history_compaction"] = compaction_stats
     if cycle_duration_ms is not None:
         metrics["last_cycle_duration_ms"] = round(cycle_duration_ms, 2)
     metadata = json.dumps(metrics)
@@ -56,26 +75,76 @@ def _heartbeat(db: Session, client: BiliMarketClient, cycle_duration_ms: float |
     db.commit()
 
 
+def _increment_usage(db: Session, user_id: str, now, *, monitor_evaluations: int = 0, price_alerts: int = 0, notifications_created: int = 0) -> None:
+    values = {
+        "user_id": user_id,
+        "usage_date": now.date(),
+        "monitor_evaluations": monitor_evaluations,
+        "price_alerts": price_alerts,
+        "notifications_created": notifications_created,
+    }
+    table = UserUsageDaily.__table__
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+        statement = sqlite_insert(table).values(values)
+    elif dialect == "postgresql":
+        statement = postgres_insert(table).values(values)
+    else:
+        usage = db.scalar(select(UserUsageDaily).where(UserUsageDaily.user_id == user_id, UserUsageDaily.usage_date == now.date()))
+        if usage is None:
+            db.add(UserUsageDaily(**values))
+        else:
+            usage.monitor_evaluations += monitor_evaluations
+            usage.price_alerts += price_alerts
+            usage.notifications_created += notifications_created
+        return
+    excluded = statement.excluded
+    db.execute(
+        statement.on_conflict_do_update(
+            index_elements=["user_id", "usage_date"],
+            set_={
+                "monitor_evaluations": table.c.monitor_evaluations + excluded.monitor_evaluations,
+                "price_alerts": table.c.price_alerts + excluded.price_alerts,
+                "notifications_created": table.c.notifications_created + excluded.notifications_created,
+            },
+        )
+    )
+
+
 def _evaluate_favorite(db: Session, favorite: BiliFavorite, product: BiliProduct, now) -> None:
     user = favorite.user
-    condition = bool(user.is_active and favorite.notify_enabled and user.email_verified_at and favorite.target_price and product.available and product.current_price is not None and product.current_price <= favorite.target_price)
+    condition = bool(user.is_active and favorite.notify_enabled and favorite.target_price and product.available and product.current_price is not None and product.current_price <= favorite.target_price)
     if condition and not favorite.last_condition_met:
         checked = product.last_success_at.isoformat() if product.last_success_at else now.isoformat()
-        subject, text_body, html_body = price_alert_email(product, f"{favorite.target_price:.2f}", checked)
-        db.add(NotificationOutbox(
-            id=__import__("uuid").uuid4().hex,
-            user_id=user.id,
+        _notification, created = create_site_notification(
+            db,
+            target_user_id=user.id,
+            kind="price_alert",
+            severity="warning",
+            title="商品已达到目标价格",
+            body=f"“{product.title}”当前最低价¥{product.current_price:.2f}，已达到你设置的目标价¥{favorite.target_price:.2f}。",
+            action_url="/favorites",
             source="price_alert",
-            dedupe_key=f"price-alert:{favorite.id}:{now.isoformat()}",
-            recipient_email=user.email,
-            subject=subject,
-            text_body=text_body,
-            html_body=html_body,
-            status="pending",
-            attempts=0,
-            next_attempt_at=now,
-            created_at=now,
-        ))
+            source_key=f"price-alert:{favorite.id}:{checked}",
+        )
+        if created:
+            _increment_usage(db, user.id, now, price_alerts=1, notifications_created=1)
+        if user.email_verified_at and user.email:
+            subject, text_body, html_body = price_alert_email(product, f"{favorite.target_price:.2f}", checked)
+            db.add(NotificationOutbox(
+                id=__import__("uuid").uuid4().hex,
+                user_id=user.id,
+                source="price_alert",
+                dedupe_key=f"price-alert:{favorite.id}:{now.isoformat()}",
+                recipient_email=user.email,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                status="pending",
+                attempts=0,
+                next_attempt_at=now,
+                created_at=now,
+            ))
         favorite.last_alert_price = product.current_price
         favorite.last_alert_at = now
     favorite.last_condition_met = condition
@@ -95,24 +164,34 @@ async def _run_product_group(
         try:
             product = await service.fetch_and_persist(product_db, cluster_id)
             favorites = product_db.scalars(select(BiliFavorite).where(BiliFavorite.id.in_(favorite_ids))).all()
+            favorites.sort(key=lambda favorite: favorite.user_id)
             if product.last_error is None:
                 for favorite in favorites:
                     _evaluate_favorite(product_db, favorite, product, now)
+            monitor_counts = {}
             for favorite in favorites:
+                monitor_counts[favorite.user_id] = monitor_counts.get(favorite.user_id, 0) + 1
                 favorite.last_evaluated_at = now
                 effective = max(favorite.check_interval_seconds, settings.bili_global_min_interval_seconds)
                 favorite.next_check_at = now + timedelta(seconds=effective)
                 favorite.updated_at = now
+            for user_id in sorted(monitor_counts):
+                _increment_usage(product_db, user_id, now, monitor_evaluations=monitor_counts[user_id])
             product_db.commit()
         except Exception:
             logger.exception("monitor cycle failed product_id=%s", product_id)
             product_db.rollback()
             failed_favorites = product_db.scalars(select(BiliFavorite).where(BiliFavorite.id.in_(favorite_ids))).all()
+            failed_favorites.sort(key=lambda favorite: favorite.user_id)
+            monitor_counts = {}
             for favorite in failed_favorites:
+                monitor_counts[favorite.user_id] = monitor_counts.get(favorite.user_id, 0) + 1
                 favorite.last_evaluated_at = now
                 effective = max(favorite.check_interval_seconds, settings.bili_global_min_interval_seconds)
                 favorite.next_check_at = now + timedelta(seconds=effective)
                 favorite.updated_at = now
+            for user_id in sorted(monitor_counts):
+                _increment_usage(product_db, user_id, now, monitor_evaluations=monitor_counts[user_id])
             product_db.commit()
         finally:
             product_db.close()
@@ -185,13 +264,21 @@ def process_outbox(db: Session) -> None:
         db.commit()
 
 
-def prune_history(db: Session) -> None:
+def prune_history(db: Session) -> dict:
     now = utcnow()
-    history_cutoff = now - timedelta(days=settings.bili_price_history_retention_days)
     request_event_cutoff = now - timedelta(days=settings.bili_request_event_retention_days)
-    db.query(BiliPriceHistory).filter(BiliPriceHistory.observed_at < history_cutoff).delete(synchronize_session=False)
-    db.query(BiliRequestEvent).filter(BiliRequestEvent.created_at < request_event_cutoff).delete(synchronize_session=False)
+    stats = compact_and_prune_history(
+        db,
+        now=now,
+        retention_days=settings.bili_price_history_retention_days,
+        batch_size=settings.history_compaction_batch_size,
+    )
+    stats["request_events_deleted"] = db.query(BiliRequestEvent).filter(BiliRequestEvent.created_at < request_event_cutoff).delete(synchronize_session=False)
+    stats["site_notifications_deleted"] = prune_notifications(
+        db, now=now, retention_days=settings.user_notification_retention_days
+    )
     db.commit()
+    return stats
 
 
 async def worker_loop() -> None:
@@ -199,24 +286,25 @@ async def worker_loop() -> None:
     await client.start()
     service = ProductService(settings, client)
     last_history_prune = 0.0
+    last_compaction_stats = None
     try:
         while True:
             with SessionLocal() as db:
                 if _lock_cycle(db):
                     try:
-                        _heartbeat(db, client)
+                        _heartbeat(db, client, compaction_stats=last_compaction_stats)
                         cycle_started = time.perf_counter()
                         try:
                             await run_scheduler_cycle(db, service)
                             process_outbox(db)
                             if time.monotonic() - last_history_prune >= 3600:
-                                prune_history(db)
+                                last_compaction_stats = prune_history(db)
                                 last_history_prune = time.monotonic()
                         except Exception:
                             logger.exception("worker cycle failed; continuing next tick")
                             db.rollback()
                         finally:
-                            _heartbeat(db, client, (time.perf_counter() - cycle_started) * 1000)
+                            _heartbeat(db, client, (time.perf_counter() - cycle_started) * 1000, last_compaction_stats)
                     finally:
                         _unlock_cycle(db)
             await asyncio.sleep(1)

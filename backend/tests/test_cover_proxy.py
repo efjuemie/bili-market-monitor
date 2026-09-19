@@ -123,7 +123,7 @@ async def test_cover_endpoint_sets_cache_control(db, monkeypatch):
     assert response.status_code == 200
     assert response.body == b"png-data"
     assert response.media_type == "image/png"
-    assert response.headers["cache-control"] == "public, max-age=300, s-maxage=300"
+    assert response.headers["cache-control"] == "public, max-age=3600, s-maxage=21600, stale-while-revalidate=86400"
     assert response.headers["x-content-type-options"] == "nosniff"
 
 

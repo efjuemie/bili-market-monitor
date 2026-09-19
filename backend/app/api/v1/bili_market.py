@@ -1,3 +1,4 @@
+import heapq
 import logging
 from datetime import timedelta
 from typing import Any, Dict
@@ -14,7 +15,14 @@ from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.core.security import utcnow
 from app.errors import AppError
-from app.models import BiliFavorite, BiliPriceHistory, BiliProduct, NotificationOutbox, User
+from app.models import (
+    BiliFavorite,
+    BiliPriceHistory,
+    BiliPriceHistoryRollup,
+    BiliProduct,
+    NotificationOutbox,
+    User,
+)
 from app.schemas import FavoriteCreateRequest, FavoriteUpdateRequest
 from app.services.bili_market.cover import COVER_CACHE_CONTROL, CoverProxyError, fetch_cover
 from app.services.bili_market.history import (
@@ -23,7 +31,7 @@ from app.services.bili_market.history import (
     HISTORY_RANGES_HOURS,
     MAX_HISTORY_POINTS,
     MIN_HISTORY_POINTS,
-    downsample_history,
+    HistoryPointRecord,
     downsample_history_stream,
 )
 from app.services.bili_market.service import (
@@ -193,17 +201,65 @@ def product_history(cluster_id: int, range: str = DEFAULT_HISTORY_RANGE, max_poi
         raise AppError("INVALID_HISTORY_MAX_POINTS", f"返回点数必须在 {MIN_HISTORY_POINTS} 到 {MAX_HISTORY_POINTS} 之间", 422)
     hours = HISTORY_RANGES_HOURS[range]
     cutoff = utcnow() - timedelta(hours=hours)
-    history_filter = (BiliPriceHistory.product_id == product.id, BiliPriceHistory.observed_at >= cutoff)
-    total_points = db.scalar(select(func.count(BiliPriceHistory.id)).where(*history_filter)) or 0
-    history_query = select(BiliPriceHistory).where(*history_filter).order_by(BiliPriceHistory.observed_at)
+    raw_filter = (BiliPriceHistory.product_id == product.id, BiliPriceHistory.observed_at >= cutoff)
+    rollup_filter = (
+        BiliPriceHistoryRollup.product_id == product.id,
+        BiliPriceHistoryRollup.bucket_end >= cutoff,
+        BiliPriceHistoryRollup.bucket_start <= utcnow(),
+    )
+    raw_count = db.scalar(select(func.count(BiliPriceHistory.id)).where(*raw_filter)) or 0
+    rollup_count = db.scalar(select(func.count(BiliPriceHistoryRollup.id)).where(*rollup_filter)) or 0
+    total_points = raw_count + rollup_count
+    total_samples = (db.scalar(select(func.coalesce(func.sum(BiliPriceHistoryRollup.sample_count), 0)).where(*rollup_filter)) or 0) + raw_count
+    raw_query = select(BiliPriceHistory).where(*raw_filter).order_by(BiliPriceHistory.observed_at, BiliPriceHistory.id)
+    rollup_query = select(BiliPriceHistoryRollup).where(*rollup_filter).order_by(BiliPriceHistoryRollup.bucket_start, BiliPriceHistoryRollup.bucket_end, BiliPriceHistoryRollup.id)
+    raw_points = (
+        HistoryPointRecord(
+            observed_at=row.observed_at,
+            period_end=row.observed_at,
+            available=row.available,
+            current_price=row.current_price if row.available else None,
+            reference_price=row.reference_price,
+        )
+        for row in db.scalars(raw_query).yield_per(1000)
+    )
+    rollup_points = (
+        HistoryPointRecord(
+            observed_at=row.bucket_start,
+            period_end=row.bucket_end,
+            available=row.last_available,
+            current_price=row.last_price if row.last_available else None,
+            reference_price=row.last_reference_price if row.last_available else None,
+            resolution_seconds=row.resolution_seconds,
+            sample_count=row.sample_count,
+            min_price=row.min_price if row.available_count else None,
+            max_price=row.max_price if row.available_count else None,
+        )
+        for row in db.scalars(rollup_query).yield_per(1000)
+    )
+    history_stream = heapq.merge(raw_points, rollup_points, key=lambda point: point.sort_key)
     if total_points <= max_points:
-        points = downsample_history(db.scalars(history_query).all(), max_points)
+        points = list(history_stream)
     else:
-        points = downsample_history_stream(db.scalars(history_query).yield_per(1000), total_points, max_points)
+        points = downsample_history_stream(history_stream, total_points, max_points)
     return {
         "cluster_id": cluster_id,
         "range": range,
         "total_points": total_points,
+        "total_samples": total_samples,
         "returned_points": len(points),
-        "items": [{"observed_at": iso(row.observed_at), "available": row.available, "current_price": money(row.current_price), "reference_price": money(row.reference_price)} for row in points],
+        "items": [
+            {
+                "observed_at": iso(row.observed_at),
+                "period_end": iso(row.period_end),
+                "available": row.available,
+                "current_price": money(row.current_price),
+                "reference_price": money(row.reference_price),
+                "resolution_seconds": row.resolution_seconds,
+                "sample_count": row.sample_count,
+                "min_price": money(row.min_price),
+                "max_price": money(row.max_price),
+            }
+            for row in points
+        ],
     }

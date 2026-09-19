@@ -22,7 +22,7 @@ ALLOWED_COVER_CONTENT_TYPES = frozenset({
     "image/png",
     "image/webp",
 })
-COVER_CACHE_CONTROL = "public, max-age=300, s-maxage=300"
+COVER_CACHE_CONTROL = "public, max-age=3600, s-maxage=21600, stale-while-revalidate=86400"
 
 
 class CoverProxyError(Exception):

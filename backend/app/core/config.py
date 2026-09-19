@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_base_url: str = "http://localhost:5173"
     app_timezone: str = "Asia/Shanghai"
-    version: str = "0.1.5"
+    version: str = "0.2.0"
     database_url: str = "sqlite:///./app.db"
 
     session_cookie_name: str = "session"
@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     bili_global_min_interval_seconds: int = Field(default=10, ge=10)
     bili_cache_reuse_seconds: int = Field(default=5, ge=0)
     bili_price_history_retention_days: int = Field(default=90, ge=1)
+    history_compaction_batch_size: int = Field(default=1000, ge=1, le=10_000)
     bili_request_event_retention_days: int = Field(default=30, ge=1)
+    user_notification_retention_days: int = Field(default=180, ge=1)
     manual_refresh_cooldown_seconds: int = Field(default=30, ge=1)
 
     email_verify_code_ttl_minutes: int = Field(default=10, ge=1)

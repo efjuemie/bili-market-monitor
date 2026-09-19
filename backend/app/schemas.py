@@ -1,7 +1,8 @@
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models import ALLOWED_INTERVALS
 
@@ -88,9 +89,14 @@ class ProductResponse(BaseModel):
 
 class HistoryPoint(BaseModel):
     observed_at: str
+    period_end: Optional[str] = None
     available: bool
     current_price: Optional[str]
     reference_price: Optional[str]
+    resolution_seconds: Optional[int] = None
+    sample_count: int = 1
+    min_price: Optional[str] = None
+    max_price: Optional[str] = None
 
 
 class FavoriteResponse(BaseModel):
@@ -125,3 +131,22 @@ class UserProfileResponse(UserResponse):
 class AdminUserResponse(UserResponse):
     favorite_count: int
     enabled_monitor_count: int
+
+
+class SiteNotificationCreateRequest(BaseModel):
+    kind: str = Field(default="admin", min_length=1, max_length=50)
+    severity: str = Field(default="info", min_length=1, max_length=20)
+    title: Optional[str] = Field(default=None, max_length=200)
+    body: Optional[str] = Field(default=None, max_length=5000)
+    action_url: Optional[str] = Field(default=None, max_length=2000)
+    template: Optional[str] = Field(default=None, max_length=50)
+    template_values: dict[str, str] = Field(default_factory=dict)
+    expires_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def require_content(self) -> "SiteNotificationCreateRequest":
+        if self.template is None and (not self.title or not self.body):
+            raise ValueError("通知标题和内容不能为空")
+        if self.template == "custom" and (not self.title or not self.body):
+            raise ValueError("自定义通知标题和内容不能为空")
+        return self

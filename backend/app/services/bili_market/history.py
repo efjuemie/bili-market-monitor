@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
+from typing import Any, Optional
 
 from app.models import BiliPriceHistory
 
@@ -19,10 +22,57 @@ MIN_HISTORY_POINTS = 2
 MAX_HISTORY_POINTS = 1000
 
 
+@dataclass(frozen=True)
+class HistoryPointRecord:
+    """Common raw/rollup shape consumed by the deterministic sampler."""
+
+    observed_at: datetime
+    period_end: datetime
+    available: bool
+    current_price: Optional[Decimal]
+    reference_price: Optional[Decimal]
+    resolution_seconds: Optional[int] = None
+    sample_count: int = 1
+    min_price: Optional[Decimal] = None
+    max_price: Optional[Decimal] = None
+
+    @property
+    def sort_key(self) -> tuple[datetime, datetime, int]:
+        return (self.observed_at, self.period_end, self.resolution_seconds or 0)
+
+
 def _price_delta(previous: Decimal | None, current: Decimal | None) -> Decimal:
     if previous is None or current is None:
         return Decimal("0")
     return abs(current - previous)
+
+
+def _range_importance(previous: Any, current: Any) -> Decimal:
+    """Score rollup-only interval extrema that are absent from last_price."""
+    extrema = [getattr(current, "min_price", None), getattr(current, "max_price", None)]
+    baselines = [
+        getattr(previous, "current_price", None),
+        getattr(previous, "min_price", None),
+        getattr(previous, "max_price", None),
+    ]
+    score = Decimal("0")
+    for extreme in extrema:
+        if extreme is None:
+            continue
+        deltas = [_price_delta(extreme, baseline) for baseline in baselines if baseline is not None]
+        if deltas:
+            delta = max(deltas)
+            baseline = max(
+                [abs(extreme), *[abs(value) for value in baselines if value is not None], Decimal("1")]
+            )
+            if delta:
+                score = max(score, Decimal("1500") + (delta / baseline) * Decimal("1500"))
+    minimum = getattr(current, "min_price", None)
+    maximum = getattr(current, "max_price", None)
+    if minimum is not None and maximum is not None and maximum != minimum:
+        baseline = max(abs(minimum), abs(maximum), Decimal("1"))
+        score = max(score, Decimal("500") + (_price_delta(minimum, maximum) / baseline) * Decimal("1000"))
+    return score
 
 
 def _point_importance(rows: Sequence[BiliPriceHistory], index: int) -> Decimal:
@@ -47,6 +97,7 @@ def _point_importance(rows: Sequence[BiliPriceHistory], index: int) -> Decimal:
         if before is not None and after is not None:
             midpoint = (before + after) / Decimal("2")
             score += abs(row.current_price - midpoint) / max(abs(midpoint), Decimal("1"))
+    score += _range_importance(previous, row)
     return score
 
 
@@ -56,6 +107,7 @@ def _transition_importance(previous: BiliPriceHistory, current: BiliPriceHistory
     if delta:
         baseline = max(abs(previous.current_price or Decimal("0")), abs(current.current_price or Decimal("0")), Decimal("1"))
         score += Decimal("1000") + (delta / baseline) * Decimal("1000")
+    score += _range_importance(previous, current)
     return score
 
 
@@ -103,8 +155,7 @@ def downsample_history(rows: Sequence[BiliPriceHistory], max_points: int) -> lis
     internal_budget = max_points - 2
     change_indices = [
         index for index in range(1, len(rows))
-        if rows[index].available != rows[index - 1].available
-        or rows[index].current_price != rows[index - 1].current_price
+        if _transition_importance(rows[index - 1], rows[index]) > 0
     ]
     state_indices = [
         index for index in change_indices

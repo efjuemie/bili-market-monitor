@@ -9,8 +9,12 @@ from sqlalchemy.orm import Session
 from app.api.v1.bili_market import product_history
 from app.core.security import utcnow
 from app.errors import AppError
-from app.models import Base, BiliPriceHistory, BiliProduct, User
-from app.services.bili_market.history import downsample_history, downsample_history_stream
+from app.models import Base, BiliPriceHistory, BiliPriceHistoryRollup, BiliProduct, User
+from app.services.bili_market.history import (
+    HistoryPointRecord,
+    downsample_history,
+    downsample_history_stream,
+)
 
 
 @pytest.fixture
@@ -83,6 +87,66 @@ def test_history_api_rejects_invalid_range_and_max_points(history_db):
     with pytest.raises(AppError, match="返回点数") as too_many:
         product_history(product.cluster_id, "24h", 1001, history_db, user)
     assert too_many.value.status_code == 422
+
+
+def test_history_api_merges_rollups_and_reports_physical_points_and_samples(history_db):
+    product, user = _history_fixture(history_db)
+    now = utcnow()
+    history_db.add(BiliPriceHistoryRollup(
+        product_id=product.id,
+        bucket_start=now - timedelta(days=2, minutes=1),
+        bucket_end=now - timedelta(days=2),
+        resolution_seconds=60,
+        sample_count=6,
+        available_count=6,
+        last_available=True,
+        min_price=Decimal("80.00"),
+        max_price=Decimal("90.00"),
+        last_price=Decimal("86.50"),
+        last_reference_price=Decimal("120.00"),
+        created_at=now,
+        updated_at=now,
+    ))
+    history_db.commit()
+
+    result = product_history(product.cluster_id, "7d", 100, history_db, user)
+
+    assert result["total_points"] == 21
+    assert result["total_samples"] == 26
+    rollup = next(item for item in result["items"] if item["resolution_seconds"] == 60)
+    assert rollup["sample_count"] == 6
+    assert rollup["min_price"] == "80.00"
+    assert rollup["max_price"] == "90.00"
+    assert rollup["period_end"] is not None
+
+
+def test_history_api_preserves_rollup_extreme_when_downsampling(history_db):
+    product, user = _history_fixture(history_db)
+    now = utcnow()
+    history_db.add_all([
+        BiliPriceHistoryRollup(
+            product_id=product.id,
+            bucket_start=now - timedelta(days=2, minutes=1000 - index),
+            bucket_end=now - timedelta(days=2, minutes=1000 - index) + timedelta(seconds=59),
+            resolution_seconds=60,
+            sample_count=6,
+            available_count=6,
+            last_available=True,
+            min_price=Decimal("50.00") if index == 555 else Decimal("100.00"),
+            max_price=Decimal("100.00"),
+            last_price=Decimal("100.00"),
+            last_reference_price=Decimal("120.00"),
+            created_at=now,
+            updated_at=now,
+        )
+        for index in range(1000)
+    ])
+    history_db.commit()
+
+    result = product_history(product.cluster_id, "90d", 10, history_db, user)
+
+    assert result["returned_points"] <= 10
+    assert any(item["min_price"] == "50.00" for item in result["items"])
 
 
 def test_downsample_keeps_endpoints_and_state_price_changes_without_zero_price():
@@ -168,3 +232,26 @@ def test_stream_downsample_prioritizes_highest_price_change_when_one_slot_remain
     assert len(sampled) <= 5
     assert 5 in sampled_indices
     assert 10 not in sampled_indices
+
+
+def test_stream_downsample_keeps_rollup_interval_extreme():
+    now = utcnow()
+    rows = [
+        HistoryPointRecord(
+            observed_at=now + timedelta(minutes=index),
+            period_end=now + timedelta(minutes=index, seconds=59),
+            available=True,
+            current_price=Decimal("100.00"),
+            reference_price=Decimal("120.00"),
+            resolution_seconds=60,
+            sample_count=6,
+            min_price=Decimal("50.00") if index == 555 else Decimal("100.00"),
+            max_price=Decimal("100.00"),
+        )
+        for index in range(1000)
+    ]
+
+    sampled = downsample_history_stream(iter(rows), len(rows), 10)
+
+    assert len(sampled) <= 10
+    assert any(point.min_price == Decimal("50.00") for point in sampled)

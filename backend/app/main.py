@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.api.v1 import admin, auth, bili_market, profile
+from app.api.v1 import admin, auth, bili_market, notifications, profile
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.errors import AppError
@@ -131,4 +131,5 @@ def health():
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(profile.router, prefix="/api/v1")
 app.include_router(bili_market.router, prefix="/api/v1")
+app.include_router(notifications.router, prefix="/api/v1")
 app.include_router(admin.router, prefix="/api/v1")

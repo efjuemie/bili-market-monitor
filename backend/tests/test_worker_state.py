@@ -9,7 +9,15 @@ from sqlalchemy.orm import Session
 
 from app import worker
 from app.core.config import Settings
-from app.models import Base, BiliFavorite, BiliProduct, NotificationOutbox, User
+from app.models import (
+    Base,
+    BiliFavorite,
+    BiliProduct,
+    NotificationOutbox,
+    SiteNotification,
+    User,
+    UserUsageDaily,
+)
 from app.worker import run_scheduler_cycle
 
 
@@ -46,10 +54,15 @@ async def test_price_alert_state_machine_notifies_once_until_condition_exits():
         assert db.get(BiliFavorite, favorite.id).last_condition_met is False
         product.available = True
         product.current_price = Decimal("99.00")
+        product.last_success_at = datetime.now(timezone.utc)
         favorite.next_check_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         db.commit()
         await run_scheduler_cycle(db, service)
         assert db.query(NotificationOutbox).count() == 2
+        usage = db.get(UserUsageDaily, (user.id, datetime.now(timezone.utc).date()))
+        assert usage is not None
+        assert usage.monitor_evaluations == 4
+        assert usage.price_alerts == 2
 
 
 class ConcurrentService:
@@ -113,3 +126,21 @@ async def test_scheduler_fetches_different_products_with_bounded_concurrency(mon
 
         assert service.max_active == 2
         assert db.query(NotificationOutbox).count() == 3
+
+
+@pytest.mark.asyncio
+async def test_price_alert_site_notification_is_independent_of_email_verification():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as db:
+        user = User(id=str(uuid4()), username="unverified", username_normalized="unverified", password_hash="hash", created_at=now, updated_at=now)
+        product = BiliProduct(id=str(uuid4()), cluster_id=456, title="unverified", detail_url="https://mall.bilibili.com/item", available=True, current_price=Decimal("50.00"), last_success_at=now, last_checked_at=now, created_at=now, updated_at=now)
+        favorite = BiliFavorite(id=str(uuid4()), user=user, product=product, target_price=Decimal("60.00"), notify_enabled=True, check_interval_seconds=10, next_check_at=now - timedelta(seconds=1), created_at=now, updated_at=now)
+        db.add_all([user, product, favorite])
+        db.commit()
+
+        await run_scheduler_cycle(db, FakeService(product))
+
+        assert db.query(NotificationOutbox).count() == 0
+        assert db.query(SiteNotification).count() == 1
