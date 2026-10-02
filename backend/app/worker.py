@@ -113,7 +113,15 @@ def _increment_usage(db: Session, user_id: str, now, *, monitor_evaluations: int
 
 def _evaluate_favorite(db: Session, favorite: BiliFavorite, product: BiliProduct, now) -> None:
     user = favorite.user
-    condition = bool(user.is_active and favorite.notify_enabled and favorite.target_price and product.available and product.current_price is not None and product.current_price <= favorite.target_price)
+    condition = bool(
+        user.is_active
+        and user.monitor_access_status == "approved"
+        and favorite.notify_enabled
+        and favorite.target_price
+        and product.available
+        and product.current_price is not None
+        and product.current_price <= favorite.target_price
+    )
     if condition and not favorite.last_condition_met:
         checked = product.last_success_at.isoformat() if product.last_success_at else now.isoformat()
         _notification, created = create_site_notification(
@@ -129,7 +137,7 @@ def _evaluate_favorite(db: Session, favorite: BiliFavorite, product: BiliProduct
         )
         if created:
             _increment_usage(db, user.id, now, price_alerts=1, notifications_created=1)
-        if user.email_verified_at and user.email:
+        if user.monitor_access_status == "approved" and user.email_verified_at and user.email:
             subject, text_body, html_body = price_alert_email(product, f"{favorite.target_price:.2f}", checked)
             db.add(NotificationOutbox(
                 id=__import__("uuid").uuid4().hex,
@@ -163,7 +171,19 @@ async def _run_product_group(
         product_db = session_factory()
         try:
             product = await service.fetch_and_persist(product_db, cluster_id)
-            favorites = product_db.scalars(select(BiliFavorite).where(BiliFavorite.id.in_(favorite_ids))).all()
+            favorites = product_db.scalars(
+                select(BiliFavorite)
+                .join(User, User.id == BiliFavorite.user_id)
+                .where(
+                    BiliFavorite.id.in_(favorite_ids),
+                    BiliFavorite.notify_enabled.is_(True),
+                    User.is_active.is_(True),
+                    User.monitor_access_status == "approved",
+                )
+                .order_by(BiliFavorite.id)
+                .with_for_update(of=BiliFavorite)
+                .execution_options(populate_existing=True)
+            ).all()
             favorites.sort(key=lambda favorite: favorite.user_id)
             if product.last_error is None:
                 for favorite in favorites:
@@ -181,7 +201,19 @@ async def _run_product_group(
         except Exception:
             logger.exception("monitor cycle failed product_id=%s", product_id)
             product_db.rollback()
-            failed_favorites = product_db.scalars(select(BiliFavorite).where(BiliFavorite.id.in_(favorite_ids))).all()
+            failed_favorites = product_db.scalars(
+                select(BiliFavorite)
+                .join(User, User.id == BiliFavorite.user_id)
+                .where(
+                    BiliFavorite.id.in_(favorite_ids),
+                    BiliFavorite.notify_enabled.is_(True),
+                    User.is_active.is_(True),
+                    User.monitor_access_status == "approved",
+                )
+                .order_by(BiliFavorite.id)
+                .with_for_update(of=BiliFavorite)
+                .execution_options(populate_existing=True)
+            ).all()
             failed_favorites.sort(key=lambda favorite: favorite.user_id)
             monitor_counts = {}
             for favorite in failed_favorites:
@@ -199,7 +231,18 @@ async def _run_product_group(
 
 async def run_scheduler_cycle(db: Session, service: ProductService) -> int:
     now = utcnow()
-    due = db.scalars(select(BiliFavorite).where(BiliFavorite.notify_enabled.is_(True), BiliFavorite.next_check_at <= now).order_by(BiliFavorite.next_check_at).limit(200)).all()
+    due = db.scalars(
+        select(BiliFavorite)
+        .join(User, User.id == BiliFavorite.user_id)
+        .where(
+            BiliFavorite.notify_enabled.is_(True),
+            BiliFavorite.next_check_at <= now,
+            User.is_active.is_(True),
+            User.monitor_access_status == "approved",
+        )
+        .order_by(BiliFavorite.next_check_at)
+        .limit(200)
+    ).all()
     if not due:
         return 0
     groups: Dict[str, Tuple[int, List[str]]] = {}
@@ -228,11 +271,41 @@ def process_outbox(db: Session) -> None:
     mailer = Mailer(settings)
     for row in rows:
         try:
-            if row.source == "price_alert":
+            if row.source == "admin_notification":
+                user = db.scalar(
+                    select(User)
+                    .where(User.id == row.user_id)
+                    .execution_options(populate_existing=True)
+                )
+                if not user or not user.is_active or not user.email_verified_at or not user.email:
+                    row.status = "cancelled"
+                    row.last_error = "通知收件人状态已失效"
+                    db.commit()
+                    continue
+                row.recipient_email = user.email
+            elif row.source == "price_alert":
                 favorite_id = row.dedupe_key.split(":", 2)[1] if row.dedupe_key.startswith("price-alert:") else ""
-                favorite = db.get(BiliFavorite, favorite_id)
-                user = db.get(User, row.user_id)
-                if not favorite or favorite.user_id != row.user_id or not user or not user.is_active or not user.email_verified_at or not user.email or not favorite.notify_enabled:
+                favorite = db.scalar(
+                    select(BiliFavorite)
+                    .where(BiliFavorite.id == favorite_id)
+                    .execution_options(populate_existing=True)
+                )
+                user = db.scalar(
+                    select(User)
+                    .where(User.id == row.user_id)
+                    .execution_options(populate_existing=True)
+                )
+                if (
+                    not favorite
+                    or favorite.user_id != row.user_id
+                    or not user
+                    or not user.is_active
+                    or user.monitor_access_status != "approved"
+                    or not user.email_verified_at
+                    or not user.email
+                    or not favorite.notify_enabled
+                    or not favorite.target_price
+                ):
                     row.status = "cancelled"
                     row.last_error = "提醒已关闭或收件人状态已失效"
                     db.commit()

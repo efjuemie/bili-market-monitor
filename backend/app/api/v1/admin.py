@@ -19,6 +19,7 @@ from app.models import (
     BiliPriceHistoryRollup,
     BiliProduct,
     BiliRequestEvent,
+    MonitorAccessRequest,
     NotificationOutbox,
     NotificationRead,
     SiteNotification,
@@ -27,7 +28,12 @@ from app.models import (
     UserUsageDaily,
     WorkerHeartbeat,
 )
-from app.schemas import SiteNotificationCreateRequest
+from app.schemas import (
+    AdminFavoriteIntervalBatchRequest,
+    MonitorAccessRejectRequest,
+    SiteNotificationCreateRequest,
+)
+from app.services.mailer import admin_notification_email
 from app.services.notifications import create_site_notification, render_custom_text, render_template
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -57,7 +63,17 @@ def dashboard(db: Session = Depends(get_db), admin: User = Depends(get_current_a
     pending = db.scalar(select(func.count()).select_from(NotificationOutbox).where(NotificationOutbox.status == "pending")) or 0
     sending_failed = db.scalar(select(func.count()).select_from(NotificationOutbox).where(NotificationOutbox.status == "failed")) or 0
     sent_24h = db.scalar(select(func.count()).select_from(NotificationOutbox).where(NotificationOutbox.status == "sent", NotificationOutbox.sent_at >= day_ago)) or 0
-    due = db.scalar(select(func.count()).select_from(BiliFavorite).where(BiliFavorite.notify_enabled.is_(True), BiliFavorite.next_check_at <= now)) or 0
+    due = db.scalar(
+        select(func.count())
+        .select_from(BiliFavorite)
+        .join(User, User.id == BiliFavorite.user_id)
+        .where(
+            BiliFavorite.notify_enabled.is_(True),
+            BiliFavorite.next_check_at <= now,
+            User.is_active.is_(True),
+            User.monitor_access_status == "approved",
+        )
+    ) or 0
     heartbeat = db.scalar(select(WorkerHeartbeat).order_by(desc(WorkerHeartbeat.last_seen_at)).limit(1))
     rollup_counts = {
         int(resolution): int(count)
@@ -101,6 +117,7 @@ def users(
     status: Optional[str] = None,
     email_verified: Optional[bool] = None,
     role: Optional[str] = None,
+    monitor_access_status: Optional[str] = None,
     sort: str = "created_at",
 ) -> Dict[str, Any]:
     if page < 1 or page_size < 1 or page_size > 100:
@@ -159,6 +176,10 @@ def users(
         conditions.append(User.email_verified_at.is_(None))
     if role:
         conditions.append(User.role == role)
+    if monitor_access_status not in {None, "approved", "not_requested", "pending", "rejected"}:
+        raise AppError("INVALID_MONITOR_ACCESS_STATUS", "监控权限状态筛选无效", 422)
+    if monitor_access_status:
+        conditions.append(User.monitor_access_status == monitor_access_status)
     if conditions:
         stmt = stmt.where(*conditions)
         count_stmt = count_stmt.where(*conditions)
@@ -183,6 +204,7 @@ def users(
             "email_verified": user.email_verified_at is not None,
             "role": user.role,
             "is_active": user.is_active,
+            "monitor_access_status": user.monitor_access_status,
             "created_at": user.created_at.isoformat(),
             "favorite_count": int(favorite_count or 0),
             "enabled_monitor_count": int(enabled_count or 0),
@@ -209,6 +231,304 @@ def _mask_email(email: Optional[str]) -> Optional[str]:
     return f"{local[:1]}***@{domain}" if domain else "***"
 
 
+def _monitor_access_request_response(request: Optional[MonitorAccessRequest]) -> Optional[dict[str, Any]]:
+    if request is None:
+        return None
+    return {
+        "id": request.id,
+        "reason": request.reason,
+        "submitted_at": request.submitted_at.isoformat(),
+        "reviewed_at": request.reviewed_at.isoformat() if request.reviewed_at else None,
+        "reviewed_by_admin_id": request.reviewed_by_admin_id,
+        "review_note": request.review_note,
+        "updated_at": request.updated_at.isoformat(),
+    }
+
+
+def _monitor_access_item(request: MonitorAccessRequest, user: User, favorite_count: int, enabled_count: int) -> dict[str, Any]:
+    return {
+        "id": request.id,
+        "user_id": user.id,
+        "username": user.username,
+        "email": _mask_email(user.email),
+        "email_verified": user.email_verified_at is not None,
+        "monitor_access_status": user.monitor_access_status,
+        "reason": request.reason,
+        "submitted_at": request.submitted_at.isoformat(),
+        "reviewed_at": request.reviewed_at.isoformat() if request.reviewed_at else None,
+        "reviewed_by_admin_id": request.reviewed_by_admin_id,
+        "review_note": request.review_note,
+        "favorite_count": int(favorite_count or 0),
+        "enabled_monitor_count": int(enabled_count or 0),
+    }
+
+
+@router.get("/monitor-access-requests")
+def monitor_access_requests(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+    page: int = 1,
+    page_size: int = 50,
+    status: Optional[str] = None,
+) -> Dict[str, Any]:
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise AppError("INVALID_PAGINATION", "分页参数无效", 422)
+    if status not in {None, "approved", "not_requested", "pending", "rejected"}:
+        raise AppError("INVALID_MONITOR_ACCESS_STATUS", "监控权限状态筛选无效", 422)
+    stats = (
+        select(
+            BiliFavorite.user_id.label("user_id"),
+            func.count(BiliFavorite.id).label("favorite_count"),
+            func.sum(case((BiliFavorite.notify_enabled.is_(True), 1), else_=0)).label("enabled_count"),
+        )
+        .group_by(BiliFavorite.user_id)
+        .subquery()
+    )
+    conditions = []
+    if status:
+        conditions.append(User.monitor_access_status == status)
+    query = (
+        select(
+            MonitorAccessRequest,
+            User,
+            func.coalesce(stats.c.favorite_count, 0),
+            func.coalesce(stats.c.enabled_count, 0),
+        )
+        .join(User, User.id == MonitorAccessRequest.user_id)
+        .outerjoin(stats, stats.c.user_id == User.id)
+        .where(*conditions)
+        .order_by(
+            case((User.monitor_access_status == "pending", 0), else_=1),
+            MonitorAccessRequest.submitted_at.desc(),
+            MonitorAccessRequest.id.desc(),
+        )
+    )
+    count_query = select(func.count()).select_from(MonitorAccessRequest).join(User, User.id == MonitorAccessRequest.user_id).where(*conditions)
+    total = int(db.scalar(count_query) or 0)
+    rows = db.execute(query.offset((page - 1) * page_size).limit(page_size)).all()
+    return {
+        "items": [_monitor_access_item(request, user, favorite_count, enabled_count) for request, user, favorite_count, enabled_count in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_more": page * page_size < total,
+    }
+
+
+def _locked_monitor_access_request(db: Session, user_id: str, admin: User) -> tuple[User, MonitorAccessRequest]:
+    if user_id == admin.id:
+        raise AppError("INVALID_ADMIN_ACTION", "不能审批自己的监控功能申请", 400)
+    user = db.scalar(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if user is None:
+        raise AppError("USER_NOT_FOUND", "未找到该用户", 404)
+    request = db.scalar(
+        select(MonitorAccessRequest)
+        .where(MonitorAccessRequest.user_id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if request is None:
+        raise AppError("MONITOR_ACCESS_REQUEST_NOT_FOUND", "未找到该用户的监控功能申请", 404)
+    if user.monitor_access_status != "pending":
+        raise AppError("MONITOR_ACCESS_REQUEST_NOT_PENDING", "该监控功能申请当前不在审核中", 409, {"monitor_access_status": user.monitor_access_status})
+    return user, request
+
+
+@router.post("/monitor-access-requests/{user_id}/approve")
+def approve_monitor_access(
+    user_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    user, request = _locked_monitor_access_request(db, user_id, admin)
+    now = utcnow()
+    user.monitor_access_status = "approved"
+    user.updated_at = now
+    request.reviewed_at = now
+    request.reviewed_by_admin_id = admin.id
+    request.review_note = None
+    request.updated_at = now
+    notification, _ = create_site_notification(
+        db,
+        target_user_id=user.id,
+        kind="admin",
+        severity="success",
+        title="监控功能申请已通过",
+        body="你的监控功能申请已通过。现在可以在商品收藏设置中开启自动监控和邮件提醒，请根据实际需求合理设置商品数量和检查频率。",
+        action_url="/favorites",
+        source="admin",
+        source_key=f"monitor-access:approved:{request.id}",
+        created_by_admin_id=admin.id,
+    )
+    _audit(db, admin, "APPROVE_MONITOR_ACCESS", "monitor_access_request", request.id, {"user_id": user.id})
+    db.commit()
+    return {
+        "user_id": user.id,
+        "monitor_access_status": user.monitor_access_status,
+        "request": _monitor_access_request_response(request),
+        "notification_id": notification.id,
+    }
+
+
+@router.post("/monitor-access-requests/{user_id}/reject")
+def reject_monitor_access(
+    user_id: str,
+    payload: Optional[MonitorAccessRejectRequest] = None,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    user, request = _locked_monitor_access_request(db, user_id, admin)
+    now = utcnow()
+    review_note = payload.review_note if payload else None
+    user.monitor_access_status = "rejected"
+    user.updated_at = now
+    request.reviewed_at = now
+    request.reviewed_by_admin_id = admin.id
+    request.review_note = review_note
+    request.updated_at = now
+    body = "你的监控功能申请暂未通过。请在个人资料中查看审核说明，修改申请理由后重新提交。"
+    if review_note:
+        body += f"\n\n审核说明：{review_note}"
+    notification, _ = create_site_notification(
+        db,
+        target_user_id=user.id,
+        kind="admin",
+        severity="warning",
+        title="监控功能申请暂未通过",
+        body=body,
+        action_url="/profile",
+        source="admin",
+        source_key=f"monitor-access:rejected:{request.id}:{now.isoformat()}",
+        created_by_admin_id=admin.id,
+    )
+    _audit(db, admin, "REJECT_MONITOR_ACCESS", "monitor_access_request", request.id, {"user_id": user.id})
+    db.commit()
+    return {
+        "user_id": user.id,
+        "monitor_access_status": user.monitor_access_status,
+        "request": _monitor_access_request_response(request),
+        "notification_id": notification.id,
+    }
+
+
+def _interval_label(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}小时"
+    return f"{seconds // 60}分钟"
+
+
+@router.patch("/users/{user_id}/favorites/check-interval")
+def update_user_favorite_intervals(
+    user_id: str,
+    payload: AdminFavoriteIntervalBatchRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    user = db.scalar(select(User).where(User.id == user_id))
+    if user is None:
+        raise AppError("USER_NOT_FOUND", "未找到该用户", 404)
+    favorite_ids = payload.favorite_ids
+    favorites = db.scalars(
+        select(BiliFavorite)
+        .where(BiliFavorite.user_id == user_id, BiliFavorite.id.in_(favorite_ids))
+        .order_by(BiliFavorite.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    found_ids = {favorite.id for favorite in favorites}
+    if found_ids != set(favorite_ids):
+        raise AppError(
+            "INVALID_FAVORITE_SELECTION",
+            "所选收藏必须全部属于该用户",
+            422,
+            {"favorite_ids": favorite_ids},
+        )
+    now = utcnow()
+    minimum_interval = get_settings().bili_global_min_interval_seconds
+    old_intervals = {favorite.id: favorite.check_interval_seconds for favorite in favorites}
+    changed = [favorite for favorite in favorites if favorite.check_interval_seconds != payload.check_interval_seconds]
+    if not changed:
+        return {
+            "updated_count": 0,
+            "no_op": True,
+            "check_interval_seconds": payload.check_interval_seconds,
+            "favorite_ids": favorite_ids,
+        }
+    before_estimate = sum(
+        86400 / max(favorite.check_interval_seconds, minimum_interval)
+        for favorite in changed
+        if favorite.notify_enabled
+    )
+    after_estimate = sum(
+        86400 / max(payload.check_interval_seconds, minimum_interval)
+        for favorite in changed
+        if favorite.notify_enabled
+    )
+    for favorite in changed:
+        favorite.check_interval_seconds = payload.check_interval_seconds
+        favorite.updated_at = now
+        if favorite.notify_enabled:
+            favorite.next_check_at = now + timedelta(seconds=max(payload.check_interval_seconds, minimum_interval))
+        else:
+            favorite.next_check_at = None
+    reduced_load = all(payload.check_interval_seconds >= old_intervals[favorite.id] for favorite in changed)
+    interval_label = _interval_label(payload.check_interval_seconds)
+    if reduced_load:
+        body = (
+            f"由于你当前监控的商品数量较多，或部分商品设置了较高刷新频率，为控制网站负载并保障服务长期稳定运行，"
+            f"管理员已将你选中的{len(changed)}件商品监控频率调整为{interval_label}。建议后续仅按实际需求添加监控商品，并避免为所有商品设置过高刷新频率。感谢理解。"
+        )
+    else:
+        body = (
+            f"管理员已将你选中的{len(changed)}件商品监控频率调整为{interval_label}。建议后续仅按实际需求添加监控商品，并合理设置刷新频率。"
+        )
+    notification, _ = create_site_notification(
+        db,
+        target_user_id=user.id,
+        kind="usage_notice",
+        severity="important",
+        title="监控频率已由管理员调整" if reduced_load else "监控频率已调整",
+        body=body,
+        action_url="/favorites",
+        source="admin",
+        source_key=f"admin-frequency:{user.id}:{uuid4().hex}",
+        created_by_admin_id=admin.id,
+    )
+    _audit(
+        db,
+        admin,
+        "BATCH_UPDATE_MONITOR_INTERVAL",
+        "user_favorites",
+        user.id,
+        {
+            "user_id": user.id,
+            "favorite_ids": favorite_ids,
+            "old_intervals": old_intervals,
+            "new_interval": payload.check_interval_seconds,
+            "updated_count": len(changed),
+            "estimated_checks_per_day_before": round(before_estimate, 2),
+            "estimated_checks_per_day_after": round(after_estimate, 2),
+        },
+    )
+    db.commit()
+    return {
+        "updated_count": len(changed),
+        "no_op": False,
+        "favorite_ids": favorite_ids,
+        "check_interval_seconds": payload.check_interval_seconds,
+        "estimated_checks_per_day_before": round(before_estimate, 2),
+        "estimated_checks_per_day_after": round(after_estimate, 2),
+        "notification_id": notification.id,
+    }
+
+
 @router.get("/users/{user_id}")
 def user_detail(user_id: str, db: Session = Depends(get_db), admin: User = Depends(get_current_admin)) -> Dict[str, Any]:
     user = db.get(User, user_id)
@@ -220,6 +540,7 @@ def user_detail(user_id: str, db: Session = Depends(get_db), admin: User = Depen
         .where(BiliFavorite.user_id == user.id)
         .order_by(BiliFavorite.created_at.desc())
     ).all()
+    access_request = db.scalar(select(MonitorAccessRequest).where(MonitorAccessRequest.user_id == user.id))
     active_session_count = db.scalar(select(func.count()).select_from(UserSession).where(UserSession.user_id == user.id, UserSession.expires_at > utcnow())) or 0
     last_seen_at = db.scalar(select(func.max(UserSession.last_seen_at)).where(UserSession.user_id == user.id))
     minimum_interval = get_settings().bili_global_min_interval_seconds
@@ -243,6 +564,8 @@ def user_detail(user_id: str, db: Session = Depends(get_db), admin: User = Depen
         "email_verified": user.email_verified_at is not None,
         "role": user.role,
         "is_active": user.is_active,
+        "monitor_access_status": user.monitor_access_status,
+        "monitor_access_request": _monitor_access_request_response(access_request),
         "created_at": user.created_at.isoformat(),
         "session_monitoring": {
             "active_session_count": active_session_count,
@@ -377,9 +700,24 @@ def send_site_notification(
     payload: SiteNotificationCreateRequest,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
+    settings: Settings = Depends(get_settings),
 ) -> Dict[str, Any]:
-    if db.get(User, user_id) is None:
+    if not isinstance(settings, Settings):
+        settings = get_settings()
+    recipient = db.get(User, user_id)
+    if recipient is None:
         raise AppError("USER_NOT_FOUND", "未找到该用户", 404)
+    if payload.send_email and (
+        not settings.smtp_enabled
+        or not recipient.is_active
+        or not recipient.email
+        or recipient.email_verified_at is None
+    ):
+        raise AppError(
+            "ADMIN_NOTIFICATION_EMAIL_UNAVAILABLE",
+            "该用户没有可用的已验证邮箱，或邮件服务尚未配置",
+            422,
+        )
     title, body = _admin_notification_content(payload)
     notification, created = create_site_notification(
         db,
@@ -394,9 +732,41 @@ def send_site_notification(
         expires_at=payload.expires_at,
         created_by_admin_id=admin.id,
     )
-    _audit(db, admin, "SEND_USER_NOTIFICATION", "site_notification", notification.id, {"user_id": user_id})
+    email_queued_count = 0
+    if payload.send_email:
+        subject, text_body, html_body = admin_notification_email(settings, title, body, payload.action_url)
+        db.add(
+            NotificationOutbox(
+                id=str(uuid4()),
+                user_id=recipient.id,
+                source="admin_notification",
+                dedupe_key=f"admin-notification:{notification.id}:{recipient.id}",
+                recipient_email=recipient.email,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                status="pending",
+                attempts=0,
+                next_attempt_at=utcnow(),
+                created_at=utcnow(),
+            )
+        )
+        email_queued_count = 1
+    _audit(
+        db,
+        admin,
+        "SEND_USER_NOTIFICATION",
+        "site_notification",
+        notification.id,
+        {"user_id": user_id, "send_email": payload.send_email, "email_queued_count": email_queued_count},
+    )
     db.commit()
-    return {"created": created, "item": _site_notification_response(notification)}
+    return {
+        "created": created,
+        "item": _site_notification_response(notification),
+        "email_queued_count": email_queued_count,
+        "email_skipped_count": 0,
+    }
 
 
 @router.post("/site-notifications/broadcast")
@@ -404,7 +774,16 @@ def broadcast_site_notification(
     payload: SiteNotificationCreateRequest,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
+    settings: Settings = Depends(get_settings),
 ) -> Dict[str, Any]:
+    if not isinstance(settings, Settings):
+        settings = get_settings()
+    if payload.send_email and not settings.smtp_enabled:
+        raise AppError(
+            "ADMIN_NOTIFICATION_EMAIL_UNAVAILABLE",
+            "邮件服务尚未配置，暂时无法同步发送邮箱通知",
+            422,
+        )
     title, body = _admin_notification_content(payload)
     notification, created = create_site_notification(
         db,
@@ -419,9 +798,53 @@ def broadcast_site_notification(
         expires_at=payload.expires_at,
         created_by_admin_id=admin.id,
     )
-    _audit(db, admin, "BROADCAST_NOTIFICATION", "site_notification", notification.id)
+    email_queued_count = 0
+    email_skipped_count = 0
+    if payload.send_email:
+        ordinary_users = db.scalars(select(User).where(User.role == "user")).all()
+        eligible_users = [
+            recipient
+            for recipient in ordinary_users
+            if recipient.is_active and recipient.email and recipient.email_verified_at is not None
+        ]
+        email_skipped_count = len(ordinary_users) - len(eligible_users)
+        subject, text_body, html_body = admin_notification_email(settings, title, body, payload.action_url)
+        now = utcnow()
+        db.add_all(
+            [
+                NotificationOutbox(
+                    id=str(uuid4()),
+                    user_id=recipient.id,
+                    source="admin_notification",
+                    dedupe_key=f"admin-notification:{notification.id}:{recipient.id}",
+                    recipient_email=recipient.email,
+                    subject=subject,
+                    text_body=text_body,
+                    html_body=html_body,
+                    status="pending",
+                    attempts=0,
+                    next_attempt_at=now,
+                    created_at=now,
+                )
+                for recipient in eligible_users
+            ]
+        )
+        email_queued_count = len(eligible_users)
+    _audit(
+        db,
+        admin,
+        "BROADCAST_NOTIFICATION",
+        "site_notification",
+        notification.id,
+        {"send_email": payload.send_email, "email_queued_count": email_queued_count, "email_skipped_count": email_skipped_count},
+    )
     db.commit()
-    return {"created": created, "item": _site_notification_response(notification)}
+    return {
+        "created": created,
+        "item": _site_notification_response(notification),
+        "email_queued_count": email_queued_count,
+        "email_skipped_count": email_skipped_count,
+    }
 
 
 @router.get("/site-notifications")
@@ -464,7 +887,17 @@ def system_status(db: Session = Depends(get_db), admin: User = Depends(get_curre
     if heartbeat:
         heartbeat_at = heartbeat.last_seen_at.replace(tzinfo=utcnow().tzinfo) if heartbeat.last_seen_at.tzinfo is None else heartbeat.last_seen_at
         online = (utcnow() - heartbeat_at).total_seconds() < 10
-    due = db.scalar(select(func.count()).select_from(BiliFavorite).where(BiliFavorite.notify_enabled.is_(True), BiliFavorite.next_check_at <= utcnow())) or 0
+    due = db.scalar(
+        select(func.count())
+        .select_from(BiliFavorite)
+        .join(User, User.id == BiliFavorite.user_id)
+        .where(
+            BiliFavorite.notify_enabled.is_(True),
+            BiliFavorite.next_check_at <= utcnow(),
+            User.is_active.is_(True),
+            User.monitor_access_status == "approved",
+        )
+    ) or 0
     return {
         "version": settings.version_value,
         "database": {"ok": True},

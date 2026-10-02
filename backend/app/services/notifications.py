@@ -29,7 +29,17 @@ NOTIFICATION_KINDS = {
     "usage_notice",
 }
 NOTIFICATION_SEVERITIES = {"info", "success", "warning", "important"}
-ALLOWED_TEMPLATE_KEYS = {"version_update", "usage_notice", "load_advice", "maintenance", "email_setup", "custom"}
+ALLOWED_TEMPLATE_KEYS = {
+    "version_update",
+    "usage_notice",
+    "load_advice",
+    "maintenance",
+    "email_setup",
+    "monitor_access_approved",
+    "monitor_access_rejected",
+    "frequency_adjusted",
+    "custom",
+}
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _URL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _HTML_TAG_RE = re.compile(r"<[^>]*>")
@@ -303,6 +313,18 @@ def render_template(template: str, values: dict[str, str]) -> tuple[str, str]:
             "请检查你的通知邮箱设置",
             "为了正常接收低价邮件提醒，请确认已在“个人资料”中绑定并验证可用的通知邮箱。",
         ),
+        "monitor_access_approved": (
+            "监控功能申请已通过",
+            "你的监控功能申请已通过。现在可以在商品收藏设置中开启自动监控和邮件提醒，请根据实际需求合理设置商品数量和检查频率。",
+        ),
+        "monitor_access_rejected": (
+            "监控功能申请暂未通过",
+            "你的监控功能申请暂未通过。请在个人资料中查看审核说明，修改申请理由后重新提交。",
+        ),
+        "frequency_adjusted": (
+            "监控频率已由管理员调整",
+            "由于你当前监控的商品数量较多，或部分商品设置了较高刷新频率，为控制网站负载并保障服务长期稳定运行，管理员已调整你选中的{favorite_count}件商品监控频率。建议后续仅按实际需求添加监控商品，并避免为所有商品设置过高刷新频率。感谢理解。",
+        ),
     }
     if template == "custom":
         raise AppError("INVALID_NOTIFICATION_TEMPLATE", "自定义通知必须直接提供标题和内容", 422)
@@ -313,7 +335,7 @@ def render_template(template: str, values: dict[str, str]) -> tuple[str, str]:
 
 
 def render_custom_text(title: str, body: str, values: dict[str, str]) -> tuple[str, str]:
-    allowed = {"username", "version", "favorite_count", "enabled_monitor_count", "estimated_checks_per_day"}
+    allowed = {"username", "version", "favorite_count", "enabled_monitor_count", "estimated_checks_per_day", "check_interval_seconds"}
     unknown = set(values) - allowed
     if unknown:
         raise AppError("INVALID_NOTIFICATION_PLACEHOLDER", "通知占位符无效", 422)

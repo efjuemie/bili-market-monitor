@@ -39,10 +39,12 @@ def test_admin_user_list_aggregates_monitoring_fields_without_per_user_queries()
     assert item["enabled_monitor_count"] == 1
     assert item["estimated_checks_per_day"] == 8640.0
     assert item["email"] == "r***@example.com"
+    assert item["monitor_access_status"] == "not_requested"
     assert item["usage_today"]["monitor_evaluations"] == 7
     assert item["usage_today"]["price_alerts"] == 2
     assert item["today_notifications_created"] == 3
     assert detail["usage_today"]["price_alerts"] == 2
+    assert detail["monitor_access_status"] == "not_requested"
     monitored = next(item for item in monitoring["items"] if item["cluster_id"] == 99001)
     assert monitored["enabled_monitors"] == 1
     assert monitored["next_check_at"] is not None

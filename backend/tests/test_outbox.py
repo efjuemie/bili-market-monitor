@@ -27,6 +27,7 @@ def _price_alert(db: Session):
         password_hash="hash",
         email="outbox@example.com",
         email_verified_at=now,
+        monitor_access_status="approved",
         created_at=now,
         updated_at=now,
     )

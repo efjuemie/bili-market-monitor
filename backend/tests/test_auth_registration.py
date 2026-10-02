@@ -25,9 +25,11 @@ def test_register_creates_user_and_session_cookie(db):
     result = register(RegisterRequest(username="  CaseUser  ", password="test-password-123"), response, db, Settings())
 
     assert result["user"]["username"] == "CaseUser"
+    assert result["user"]["monitor_access_status"] == "not_requested"
     assert response.headers["set-cookie"].startswith("session=")
     user = db.scalar(select(User).where(User.username_normalized == "caseuser"))
     assert user is not None
+    assert user.monitor_access_status == "not_requested"
     assert db.scalar(select(UserSession).where(UserSession.user_id == user.id)) is not None
 
 

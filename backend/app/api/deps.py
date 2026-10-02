@@ -43,3 +43,20 @@ def get_current_admin(user: User = Depends(get_current_user)) -> User:
     if user.role != "admin":
         raise AppError("ADMIN_REQUIRED", "需要管理员权限", 403)
     return user
+
+
+def ensure_monitor_access(user: User, target_price: object = None) -> None:
+    """Enforce every prerequisite for enabling automatic monitoring."""
+    if not user.is_active:
+        raise AppError("ACCOUNT_DISABLED", "账号已被禁用", 403)
+    if not user.email or user.email_verified_at is None:
+        raise AppError("EMAIL_VERIFICATION_REQUIRED", "开启邮件提醒前，请先前往“个人资料”绑定并验证通知邮箱。", 400)
+    if user.monitor_access_status != "approved":
+        raise AppError(
+            "MONITOR_ACCESS_NOT_APPROVED",
+            "当前账号尚未获得监控功能权限，请前往个人资料提交申请。",
+            403,
+            {"monitor_access_status": user.monitor_access_status},
+        )
+    if target_price is None:
+        raise AppError("INVALID_TARGET_PRICE", "开启邮件提醒必须设置目标价格", 422)

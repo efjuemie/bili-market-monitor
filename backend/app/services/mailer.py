@@ -3,6 +3,7 @@ import logging
 import smtplib
 from email.message import EmailMessage
 from typing import Optional
+from urllib.parse import urlsplit
 
 from app.core.config import Settings
 
@@ -89,4 +90,45 @@ def price_alert_email(product, target_price: str, checked_at: str) -> tuple[str,
         f"<p><a href='{html.escape(detail_url)}' style='display:inline-block;padding:10px 16px;background:#00aeec;color:white;text-decoration:none;border-radius:6px'>前往 B 站市集</a></p>"
         f"<p>{html.escape(detail_url)}</p>"
     )
+    return subject, text, html_body
+
+
+def admin_notification_email(
+    settings: Settings,
+    title: str,
+    body: str,
+    action_url: Optional[str] = None,
+) -> tuple[str, str, str]:
+    """Render a plain-text and escaped HTML administrator notification email."""
+    title = title.strip()
+    body = body.strip()
+    if action_url:
+        action_url = action_url.strip()
+        parsed = urlsplit(action_url)
+        if (
+            not action_url.startswith("/")
+            or action_url.startswith("//")
+            or "\\" in action_url
+            or parsed.scheme
+            or parsed.netloc
+            or any(ord(char) < 32 or ord(char) == 127 for char in action_url)
+        ):
+            raise ValueError("admin notification action_url must be a site-relative path")
+        link = f"{settings.app_base_url.rstrip('/')}{action_url}"
+    else:
+        link = None
+    # Site notifications intentionally permit line breaks in their plain-text
+    # body/title. Email headers cannot contain them, so normalize only the
+    # subject while preserving the full title in both message bodies.
+    subject_title = " ".join(title.replace("\r", "\n").splitlines()).strip()
+    subject = f"【B站市集好价提示系统】{subject_title}"
+    text = f"{title}\n\n{body}"
+    if link:
+        text += f"\n\n查看详情：\n{link}"
+    escaped_title = html.escape(title)
+    escaped_body = html.escape(body).replace("\n", "<br>")
+    html_body = f"<h2>{escaped_title}</h2><p>{escaped_body}</p>"
+    if link:
+        escaped_link = html.escape(link, quote=True)
+        html_body += f'<p><a href="{escaped_link}">查看详情</a></p>'
     return subject, text, html_body

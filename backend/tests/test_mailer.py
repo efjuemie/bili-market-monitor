@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.config import Settings
-from app.services.mailer import Mailer, price_alert_email
+from app.services.mailer import Mailer, admin_notification_email, price_alert_email
 
 
 def test_price_email_contains_plain_text_purchase_link_and_cover():
@@ -13,6 +13,15 @@ def test_price_email_contains_plain_text_purchase_link_and_cover():
     assert "https://mall.bilibili.com/item" in text
     assert "cover.jpg" in html
     assert "105.00" in subject
+
+
+def test_admin_notification_email_normalizes_subject_line_breaks_and_escapes_html():
+    settings = Settings(app_base_url="https://monitor.example.com")
+    subject, text, html = admin_notification_email(settings, "标题\r\n第二行", "正文 <内容> & 其他", "/profile")
+    assert "\r" not in subject and "\n" not in subject
+    assert "标题" in text and "第二行" in text
+    assert "&lt;内容&gt;" in html and "&amp;" in html
+    assert "https://monitor.example.com/profile" in text
 
 
 def test_unconfigured_smtp_reports_unsent_without_marking_delivery():

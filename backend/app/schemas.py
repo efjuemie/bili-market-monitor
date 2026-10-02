@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -121,6 +122,7 @@ class UserResponse(BaseModel):
     email_verified: bool
     role: str
     is_active: bool
+    monitor_access_status: str
     created_at: str
 
 
@@ -142,6 +144,7 @@ class SiteNotificationCreateRequest(BaseModel):
     template: Optional[str] = Field(default=None, max_length=50)
     template_values: dict[str, str] = Field(default_factory=dict)
     expires_at: Optional[datetime] = None
+    send_email: bool = False
 
     @model_validator(mode="after")
     def require_content(self) -> "SiteNotificationCreateRequest":
@@ -150,3 +153,66 @@ class SiteNotificationCreateRequest(BaseModel):
         if self.template == "custom" and (not self.title or not self.body):
             raise ValueError("自定义通知标题和内容不能为空")
         return self
+
+
+_PLAIN_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_PLAIN_TEXT_HTML_RE = re.compile(r"<[^>]*>")
+
+
+def _validate_plain_text(value: object, *, field_name: str, min_length: int = 0, max_length: int = 500) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name}必须是文本")
+    value = value.strip()
+    if len(value) < min_length:
+        raise ValueError(f"{field_name}至少需要{min_length}个字符")
+    if len(value) > max_length:
+        raise ValueError(f"{field_name}不能超过{max_length}个字符")
+    if _PLAIN_TEXT_CONTROL_RE.search(value) or _PLAIN_TEXT_HTML_RE.search(value):
+        raise ValueError(f"{field_name}必须是纯文本")
+    return value
+
+
+class MonitorAccessRequestCreate(BaseModel):
+    reason: str
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def validate_reason(cls, value: object) -> str:
+        return _validate_plain_text(value, field_name="申请理由", min_length=10, max_length=500)
+
+
+class MonitorAccessRejectRequest(BaseModel):
+    review_note: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("review_note", mode="before")
+    @classmethod
+    def validate_review_note(cls, value: object) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("审核说明必须是文本")
+        value = value.strip()
+        if not value:
+            return None
+        return _validate_plain_text(value, field_name="审核说明", max_length=500)
+
+
+class AdminFavoriteIntervalBatchRequest(BaseModel):
+    favorite_ids: list[str] = Field(min_length=1, max_length=20)
+    check_interval_seconds: int
+
+    @field_validator("favorite_ids")
+    @classmethod
+    def validate_favorite_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("收藏ID不能重复")
+        if any(not item or len(item) > 36 for item in value):
+            raise ValueError("收藏ID格式无效")
+        return value
+
+    @field_validator("check_interval_seconds")
+    @classmethod
+    def validate_interval(cls, value: int) -> int:
+        if value not in ALLOWED_INTERVALS:
+            raise ValueError("请选择系统支持的监控频率")
+        return value

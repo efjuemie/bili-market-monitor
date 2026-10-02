@@ -12,8 +12,8 @@ from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.core.security import hash_password, new_code, utcnow, verify_password
 from app.errors import AppError
-from app.models import EmailVerificationChallenge, NotificationOutbox, User
-from app.schemas import EmailCodeRequest, VerifyEmailRequest
+from app.models import EmailVerificationChallenge, MonitorAccessRequest, NotificationOutbox, User
+from app.schemas import EmailCodeRequest, MonitorAccessRequestCreate, VerifyEmailRequest
 from app.services.mailer import Mailer, verification_email
 from app.services.notifications import create_site_notification
 
@@ -38,8 +38,83 @@ def profile(user: User = Depends(get_current_user)) -> dict:
         "email_verified": user.email_verified_at is not None,
         "role": user.role,
         "is_active": user.is_active,
+        "monitor_access_status": user.monitor_access_status,
         "created_at": user.created_at.isoformat(),
     }
+
+
+def _monitor_access_request_response(request: MonitorAccessRequest | None) -> dict | None:
+    if request is None:
+        return None
+    return {
+        "reason": request.reason,
+        "submitted_at": request.submitted_at.isoformat(),
+        "reviewed_at": request.reviewed_at.isoformat() if request.reviewed_at else None,
+        "review_note": request.review_note,
+    }
+
+
+@router.get("/monitor-access")
+def monitor_access_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    request = db.scalar(select(MonitorAccessRequest).where(MonitorAccessRequest.user_id == user.id))
+    return {
+        "status": user.monitor_access_status,
+        "request": _monitor_access_request_response(request),
+    }
+
+
+@router.post("/monitor-access/request")
+def request_monitor_access(
+    payload: MonitorAccessRequestCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    # PostgreSQL serializes concurrent submissions for one account. SQLite
+    # ignores FOR UPDATE, but the unique request row still protects the data.
+    locked_user = db.scalar(
+        select(User)
+        .where(User.id == user.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked_user is None:
+        raise AppError("AUTH_REQUIRED", "请先登录", 401)
+    if not locked_user.is_active:
+        raise AppError("ACCOUNT_DISABLED", "账号已被禁用", 403)
+    if not locked_user.email or locked_user.email_verified_at is None:
+        raise AppError("EMAIL_VERIFICATION_REQUIRED", "提交监控功能申请前，请先验证通知邮箱。", 400)
+    if locked_user.monitor_access_status == "pending":
+        raise AppError("MONITOR_ACCESS_REQUEST_ALREADY_PENDING", "监控功能申请正在审核中，请勿重复提交", 409)
+    if locked_user.monitor_access_status == "approved":
+        raise AppError("MONITOR_ACCESS_ALREADY_APPROVED", "当前账号已经获得监控功能权限", 409)
+
+    now = utcnow()
+    request = db.scalar(
+        select(MonitorAccessRequest)
+        .where(MonitorAccessRequest.user_id == locked_user.id)
+        .with_for_update()
+    )
+    if request is None:
+        request = MonitorAccessRequest(
+            id=str(uuid4()),
+            user_id=locked_user.id,
+            reason=payload.reason,
+            submitted_at=now,
+            updated_at=now,
+        )
+        db.add(request)
+    else:
+        request.reason = payload.reason
+        request.submitted_at = now
+        request.reviewed_at = None
+        request.reviewed_by_admin_id = None
+        request.review_note = None
+        request.updated_at = now
+    locked_user.monitor_access_status = "pending"
+    locked_user.updated_at = now
+    db.commit()
+    db.refresh(request)
+    return {"status": locked_user.monitor_access_status, "request": _monitor_access_request_response(request)}
 
 
 @router.post("/email/send-code")

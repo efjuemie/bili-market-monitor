@@ -35,6 +35,7 @@ def public_user(user: User) -> dict:
         "email_verified": user.email_verified_at is not None,
         "role": user.role,
         "is_active": user.is_active,
+        "monitor_access_status": user.monitor_access_status,
         "created_at": user.created_at.isoformat(),
     }
 
@@ -62,7 +63,8 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
     now = utcnow()
     user = User(
         id=str(uuid4()), username=username, username_normalized=normalized,
-        password_hash=hash_password(payload.password), created_at=now, updated_at=now,
+        password_hash=hash_password(payload.password), monitor_access_status="not_requested",
+        created_at=now, updated_at=now,
     )
     db.add(user)
     try:

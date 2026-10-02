@@ -25,6 +25,12 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(
+            "monitor_access_status IN ('approved','not_requested','pending','rejected')",
+            name="ck_users_monitor_access_status",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     username: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -34,6 +40,9 @@ class User(Base):
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     role: Mapped[str] = mapped_column(String(20), default="user", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    monitor_access_status: Mapped[str] = mapped_column(
+        String(20), default="not_requested", server_default="not_requested", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -41,6 +50,28 @@ class User(Base):
     favorites: Mapped[List["BiliFavorite"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     notification_reads: Mapped[List["NotificationRead"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     usage_daily: Mapped[List["UserUsageDaily"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    monitor_access_request: Mapped[Optional["MonitorAccessRequest"]] = relationship(
+        back_populates="user",
+        uselist=False,
+        foreign_keys="MonitorAccessRequest.user_id",
+        cascade="all, delete-orphan",
+    )
+
+
+class MonitorAccessRequest(Base):
+    __tablename__ = "monitor_access_requests"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_monitor_access_requests_user"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    reviewed_by_admin_id: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    review_note: Mapped[Optional[str]] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="monitor_access_request", foreign_keys=[user_id])
 
 
 class UserSession(Base):

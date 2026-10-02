@@ -18,7 +18,7 @@ def main() -> None:
         if db.scalar(select(User).where(User.username_normalized == normalized)):
             raise SystemExit("用户名已存在")
         now = utcnow()
-        db.add(User(id=str(uuid4()), username=username, username_normalized=normalized, password_hash=hash_password(password), role="admin", created_at=now, updated_at=now))
+        db.add(User(id=str(uuid4()), username=username, username_normalized=normalized, password_hash=hash_password(password), role="admin", monitor_access_status="approved", created_at=now, updated_at=now))
         db.commit()
     print("管理员创建成功")
 

@@ -10,7 +10,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import ensure_monitor_access, get_current_user
 from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.core.security import utcnow
@@ -102,10 +102,8 @@ def list_favorites(user: User = Depends(get_current_user), db: Session = Depends
 
 @router.post("/favorites")
 async def create_favorite(payload: FavoriteCreateRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user), service: ProductService = Depends(product_service)) -> Dict[str, Any]:
-    if payload.notify_enabled and user.email_verified_at is None:
-        raise AppError("EMAIL_VERIFICATION_REQUIRED", "开启邮件提醒前，请先前往“个人资料”绑定并验证通知邮箱。", 400)
-    if payload.notify_enabled and payload.target_price is None:
-        raise AppError("INVALID_TARGET_PRICE", "开启邮件提醒必须设置目标价格", 422)
+    if payload.notify_enabled:
+        ensure_monitor_access(user, payload.target_price)
     product = await service.fetch_and_persist(db, validate_cluster_id(payload.cluster_id))
     if db.scalar(select(BiliFavorite).where(BiliFavorite.user_id == user.id, BiliFavorite.product_id == product.id)):
         raise AppError("FAVORITE_ALREADY_EXISTS", "该商品已经收藏", 409)
@@ -142,10 +140,8 @@ def update_favorite(cluster_id: int, payload: FavoriteUpdateRequest, db: Session
         favorite.target_price = payload.target_price
     if payload.notify_enabled is not None:
         target_price = payload.target_price if "target_price" in payload.model_fields_set else favorite.target_price
-        if payload.notify_enabled and user.email_verified_at is None:
-            raise AppError("EMAIL_VERIFICATION_REQUIRED", "开启邮件提醒前，请先前往“个人资料”绑定并验证通知邮箱。", 400)
-        if payload.notify_enabled and target_price is None:
-            raise AppError("INVALID_TARGET_PRICE", "开启邮件提醒必须设置目标价格", 422)
+        if payload.notify_enabled and not favorite.notify_enabled:
+            ensure_monitor_access(user, target_price)
         favorite.notify_enabled = payload.notify_enabled
     if payload.check_interval_seconds is not None:
         favorite.check_interval_seconds = payload.check_interval_seconds
